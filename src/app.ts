@@ -12,7 +12,6 @@ import { notifyErrorThreshold } from "./services/alerts.js";
 export const app = express();
 
 app.disable("x-powered-by");
-app.use(express.json({ limit: config.maxBodySize }));
 app.use((_req, res, next) => { res.on("finish", () => recordRequest(res.statusCode)); next(); });
 app.use((req, res, next) => {
   if (!config.compressionEnabled || !req.acceptsEncodings("gzip")) return next();
@@ -31,15 +30,6 @@ app.get("/health", (_req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.get("/metrics", (_req, res) => {
-  if (!config.metricsEnabled) return res.status(404).json({ error: "metrics disabled" });
-  res.type("text/plain; version=0.0.4").send(metrics());
-});
-
-app.get("/dashboard", (_req, res) => {
-  res.type("html").send(`<!doctype html><title>Log Service</title><main><h1>Log Service Dashboard</h1><form id=f><input name=service placeholder=service><select name=level><option value="">all levels</option><option>debug</option><option>info</option><option>warn</option><option>error</option></select><input name=q placeholder="message search"><button>Search</button></form><pre id=logs>Submit a search.</pre><h2>Metrics</h2><pre id=m>Loading…</pre><script>const out=document.querySelector('#logs');document.querySelector('#f').onsubmit=async e=>{e.preventDefault();const p=new URLSearchParams(new FormData(e.target));for(const[k,v]of [...p])if(!v)p.delete(k);out.textContent=JSON.stringify(await fetch('/logs?'+p).then(r=>r.json()),null,2)};fetch('/metrics').then(r=>r.text()).then(t=>m.textContent=t)</script></main>`);
-});
-
 app.use(async (req, res, next) => {
   if (!config.authEnabled || req.path === "/health") return next();
   const authorization = req.get("authorization");
@@ -55,6 +45,15 @@ app.use(async (req, res, next) => {
   }
 });
 
+app.get("/metrics", (_req, res) => {
+  if (!config.metricsEnabled) return res.status(404).json({ error: "metrics disabled" });
+  res.type("text/plain; version=0.0.4").send(metrics());
+});
+
+app.get("/dashboard", (_req, res) => {
+  res.type("html").send(`<!doctype html><title>Log Service</title><main><h1>Log Service Dashboard</h1><form id=f><input name=service placeholder=service><select name=level><option value="">all levels</option><option>debug</option><option>info</option><option>warn</option><option>error</option></select><input name=q placeholder="message search"><button>Search</button></form><pre id=logs>Submit a search.</pre><h2>Metrics</h2><pre id=m>Loading…</pre><script>const out=document.querySelector('#logs');document.querySelector('#f').onsubmit=async e=>{e.preventDefault();const p=new URLSearchParams(new FormData(e.target));for(const[k,v]of [...p])if(!v)p.delete(k);out.textContent=JSON.stringify(await fetch('/logs?'+p).then(r=>r.json()),null,2)};fetch('/metrics').then(r=>r.text()).then(t=>m.textContent=t)</script></main>`);
+});
+
 function principalFor(res: Response): Principal {
   return res.locals.principal ?? { tenantId: "default", scopes: ["ingest", "query"], seeded: false };
 }
@@ -68,10 +67,18 @@ app.use((req, res, next) => {
   return next();
 });
 
-app.post("/logs", async (req, res, next) => {
+app.use((req, res, next) => {
+  if (req.method !== "POST" || req.path !== "/logs") return next();
   if (!beginIngestion(config.backpressureEnabled, config.maxConcurrentIngestions)) {
     return res.set("retry-after", "1").status(503).json({ error: "ingestion queue is full" });
   }
+  res.once("finish", endIngestion);
+  return next();
+});
+
+app.use(express.json({ limit: config.maxBodySize }));
+
+app.post("/logs", async (req, res, next) => {
   try {
     const result = validateIngestionBatch(req.body);
     const principal = principalFor(res);
@@ -90,8 +97,6 @@ app.post("/logs", async (req, res, next) => {
     return res.status(200).json({ accepted: result.validLogs.length, rejected: result.rejected });
   } catch (error) {
     return next(error);
-  } finally {
-    endIngestion();
   }
 });
 

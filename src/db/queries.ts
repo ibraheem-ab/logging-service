@@ -161,7 +161,7 @@ export async function getAggregate(params: AggregateQuery, tenantId = "default")
   const until = params.until!;
   const rollupSince = new Date(Math.ceil(since.getTime() / 1_000) * 1_000);
   const rollupUntil = new Date(Math.floor(until.getTime() / 1_000) * 1_000);
-  if (rollupSince >= rollupUntil) return getRawAggregate(params);
+  if (rollupSince >= rollupUntil) return getRawAggregate(params, params.since, params.until, tenantId);
 
   const rows: AggregateRow[] = [];
   if (since < rollupSince) rows.push(...await getRawAggregate(params, since, rollupSince));

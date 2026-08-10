@@ -31,6 +31,9 @@ async function main() {
   if (process.env.AUTH_EXPECTED === "true") {
     const unauthenticated = await fetch(`${baseUrl}/logs`);
     assert(unauthenticated.status === 401, "auth mode must reject requests without credentials");
+  } else {
+    const ignoredCredential = await fetch(`${baseUrl}/logs`, { headers: { authorization: "Bearer ignored-when-auth-is-disabled" } });
+    assert(ignoredCredential.status === 200, "core mode must ignore an Authorization header when authentication is disabled");
   }
 
   const timestamp = new Date().toISOString();

@@ -96,6 +96,16 @@ npm run smoke:test
 TOTAL_LOGS=1000000 BATCH_SIZE=1000 CONCURRENCY=8 npm run load:test
 ```
 
+اختبارات التكامل الاختيارية مستقلة في `scripts/optional-*-integration.ts`. تُشغّل كل واحدة على نسخة مفعّلة من الميزة المقابلة عبر `BASE_URL`:
+
+```bash
+npm run optional:enabled:test     # metrics, dashboard, live tail, dead letters, query language, gzip
+npm run optional:auth:test        # authentication, scopes, tenant and rollup isolation
+CONTROL_MODE=rate npm run optional:controls:test
+CONTROL_MODE=backpressure npm run optional:controls:test
+npm run optional:alerts:test      # requires ALERT_WEBHOOK_URL=http://host.docker.internal:18089
+```
+
 تغطي اختبارات الوحدة validation للـbatch وcursor parser والتواريخ غير الموجودة. أما `smoke:test` فيتحقق من المسارات المطلوبة وسلوك batch partial rejection والـcursor وفلترة attributes النصية وaggregation الإلزامي بـ`5m`. يولّد `load:test` batches متوازية ويشغّل aggregation مرة كل ثانية، ثم يطبع معدل الإدخال وp50/p95. افتراضيًا تستخدم السكربتات `127.0.0.1:8080` لتجنب اختلاف localhost/IPv6 على Windows، ويمكن تغييرها عبر `BASE_URL`.
 
 ### نتائج قياس فعلية
@@ -132,11 +142,11 @@ TOTAL_LOGS=1000000 BATCH_SIZE=1000 CONCURRENCY=8 npm run load:test
 
 كل الميزات التالية additive ولا تغيّر شكل أو نجاح الواجهات المطلوبة عند تشغيل `docker compose up` بلا إعدادات:
 
-- **Authentication وmulti-tenancy**: معطّلة افتراضيًا عبر `AUTH_ENABLED=false`. عند `AUTH_ENABLED=true` و`LOADGEN_API_KEY=<key>` تُزرع المفتاح تلقائيًا بصلاحيات ingest/query ضمن tenant `loadgen`. يدعم `Authorization: Bearer <key>` و`X-API-Key`، بينما يبقى `/health` عامًا.
+- **Authentication وmulti-tenancy**: معطّلة افتراضيًا عبر `AUTH_ENABLED=false`. عند `AUTH_ENABLED=true` و`LOADGEN_API_KEY=<key>` تُزرع المفتاح تلقائيًا بصلاحيات ingest/query ضمن tenant `loadgen`. يدعم `Authorization: Bearer <key>` و`X-API-Key`؛ يبقى `/health` عامًا، وتحمي المصادقة بقية المسارات.
 - **Rate limiting**: معطّل عبر `RATE_LIMIT_ENABLED=false`. فعّله مع `RATE_LIMIT_REQUESTS` (الافتراضي 1000 طلب/دقيقة)؛ المفتاح المزروع لمولد الحمل معفى منه.
 - **Backpressure**: معطّل عبر `BACKPRESSURE_ENABLED=false`. عند تفعيله يحد `MAX_CONCURRENT_INGESTIONS` (الافتراضي 16) ويرد `503` و`Retry-After` بدل فقد السجلات.
 - **Dead letters**: معطّلة عبر `DEAD_LETTER_ENABLED=false`. عند تفعيلها تُحفظ السجلات المرفوضة وأسبابها في جدول `dead_letters` من دون تغيير استجابة `POST /logs`.
-- **Metrics وdashboard**: `/metrics` يعرض عدادات Prometheus عندما `METRICS_ENABLED=true` (افتراضيًا true)، و`/dashboard` يعرض لوحة تشغيل خفيفة.
+- **Metrics وdashboard**: `/metrics` يعرض عدادات Prometheus عند `METRICS_ENABLED=true` (افتراضيًا false)، و`/dashboard` يعرض لوحة تشغيل خفيفة.
 - **Live tail**: `/logs/tail` هو SSE للسجلات المقبولة حديثًا، ويعطّل عبر `LIVE_TAIL_ENABLED=false`.
 - **Alert webhook**: معطّل عبر `ALERTS_ENABLED=false`. يتطلب `ALERT_WEBHOOK_URL` ويدفع حدثًا عند بلوغ `ALERT_ERROR_THRESHOLD` (الافتراضي 1) من سجلات error ضمن batch.
 - **Custom query language**: استخدم المعامل الإضافي `query` مثل `query=service:checkout level:error attr.region:eu q:declined` في `/logs` أو `/logs/aggregate`؛ يبقى استعمال المعاملات القياسية كما هو.

@@ -11,6 +11,10 @@
     "load:test": "tsx scripts/load-test.ts",
     "smoke:test": "tsx scripts/contract-smoke-test.ts",
     "optional:smoke:test": "tsx scripts/optional-smoke-test.ts",
+    "optional:enabled:test": "tsx scripts/optional-enabled-smoke.ts",
+    "optional:auth:test": "tsx scripts/optional-auth-integration.ts",
+    "optional:controls:test": "tsx scripts/optional-controls-integration.ts",
+    "optional:alerts:test": "tsx scripts/optional-alert-integration.ts",
     "db:generate": "drizzle-kit generate"
   },
   "keywords": [],
