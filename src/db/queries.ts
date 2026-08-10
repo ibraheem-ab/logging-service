@@ -164,9 +164,9 @@ export async function getAggregate(params: AggregateQuery, tenantId = "default")
   if (rollupSince >= rollupUntil) return getRawAggregate(params, params.since, params.until, tenantId);
 
   const rows: AggregateRow[] = [];
-  if (since < rollupSince) rows.push(...await getRawAggregate(params, since, rollupSince));
+  if (since < rollupSince) rows.push(...await getRawAggregate(params, since, rollupSince, tenantId));
   rows.push(...await getRollupAggregate(params, rollupSince, rollupUntil, tenantId));
-  if (rollupUntil < until) rows.push(...await getRawAggregate(params, rollupUntil, until));
+  if (rollupUntil < until) rows.push(...await getRawAggregate(params, rollupUntil, until, tenantId));
   return mergeAggregateRows(rows);
 }
 

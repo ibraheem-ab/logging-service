@@ -1,24 +1,24 @@
 # Log Ingestion and Query Service
 
-خدمة Node.js/TypeScript لتخزين واستعلام structured logs. PostgreSQL هو مصدر الحقيقة الوحيد للقراءة والكتابة، وتبدأ الخدمة بالكامل عبر Docker Compose.
+A Node.js/TypeScript service for storing and querying structured logs. PostgreSQL is the sole source of truth for reads and writes. The entire stack starts with Docker Compose.
 
-## التشغيل
+## Running the Service
 
 ```bash
 docker compose up
 ```
 
-عند اكتمال startup تصبح الخدمة متاحة على `http://localhost:8080`. لا تحتاج إلى ملف `.env` مع Docker Compose. استخدم `docker compose up --build` فقط إذا أردت فرض إعادة بناء الصورة بعد تعديل الكود. للاستخدام المحلي انسخ `.env.example` إلى `.env` ثم شغّل `npm run dev`. يستخدم Compose شبكة bridge مخصصة، فيتصل التطبيق بقاعدة البيانات عبر اسم الخدمة `postgres`، ويطبق حدود التقييم: التطبيق `0.5 CPU` و`256 MB`، وPostgreSQL `1 CPU` و`1 GB`.
+Once startup completes, the service is available at `http://localhost:8080`. No `.env` file is required with Docker Compose. Use `docker compose up --build` only if you need to force an image rebuild after code changes. For local development without Compose, copy `.env.example` to `.env` and run `npm run dev`. Compose uses a dedicated bridge network; the application connects to the database via the service hostname `postgres`. Resource limits match the evaluation constraints: application `0.5 CPU` and `256 MB`, PostgreSQL `1 CPU` and `1 GB`.
 
-## الواجهات
+## API Endpoints
 
 ### `GET /health`
 
-يعيد `200` فقط بعد الاتصال بقاعدة البيانات وتطبيق الـschema والفهارس. لا يتطلب مصادقة.
+Returns `200` only after the database connection is established, the schema and indexes are applied, and the service is ready to accept traffic. Does not require authentication.
 
 ### `POST /logs`
 
-يستقبل batch دائمًا، ولو احتوى على سجل واحد:
+Always accepts a batch; a batch containing a single log entry is valid.
 
 ```json
 {
@@ -32,62 +32,62 @@ docker compose up
 }
 ```
 
-يتحقق من كل عنصر بصورة مستقلة. القيم المسموحة لـ`level`: `debug`, `info`, `warn`, `error`. يجب أن يكون `timestamp` ISO 8601 ولا يتجاوز خمس دقائق في المستقبل؛ و`service` و`message` نصين غير فارغين؛ و`attributes` كائنًا مسطحًا بقيم string/number/boolean. إذا قُبل سجل واحد على الأقل يعيد `200`:
+Each entry is validated independently. Allowed `level` values: `debug`, `info`, `warn`, `error`. `timestamp` must be ISO 8601 and must not be more than five minutes in the future; `service` and `message` must be non-empty strings; `attributes` must be a flat object with string, number, or boolean values. If at least one entry is accepted, returns `200`:
 
 ```json
 { "accepted": 1, "rejected": [] }
 ```
 
-إذا رُفضت كل السجلات، أو كان body غير مطابق للعقد/JSON معطوبًا، يعيد `400`.
+If all entries are rejected, or the body does not match the contract / JSON is malformed, returns `400`.
 
 ### `GET /logs`
 
-يدعم الجمع الحر للـfilters: `service`, `level`, `since`, `until`, `q`, و`attr.<key>`. مثال:
+Supports freely combinable filters: `service`, `level`, `since`, `until`, `q`, and `attr.<key>`. Example:
 
 ```text
 /logs?service=checkout&level=error&since=2026-07-20T00:00:00Z&attr.region=eu-west&q=declined&limit=100
 ```
 
-قيمة `attr.<key>` تصل من query string، لذلك يطابق `attr.user_id=42` القيمة النصية `"42"` والقيمة العددية `42` على حد سواء؛ لا تضيع السمات النصية التي تبدو كأرقام أو booleans.
+`attr.<key>` values come from the query string, so `attr.user_id=42` matches both the string value `"42"` and the numeric value `42`; string attributes that look like numbers or booleans are not lost.
 
-`limit` بين 1 و1000 (100 افتراضيًا). الترتيب `timestamp DESC, id DESC`. يعيد:
+`limit` is between 1 and 1000 (default 100). Results are ordered by `timestamp DESC, id DESC`. Returns:
 
 ```json
 { "logs": [], "next_cursor": null }
 ```
 
-عندما توجد صفحة أخرى، `next_cursor` قيمة opaque مشفرة؛ أرسلها كما هي في `cursor` للصفحة التالية. المعاملات غير الصالحة تعيد `{ "error": "..." }` مع `400`.
+When another page exists, `next_cursor` is an opaque encoded value; pass it unchanged as `cursor` for the next page. Invalid parameters return `{ "error": "..." }` with `400`.
 
 ### `GET /logs/aggregate`
 
-يدعم filters: `service`, `level`, `q` و`attr.<key>`، مع معاملات aggregation التالية:
+Supports filters: `service`, `level`, `q`, and `attr.<key>`, plus the following aggregation parameters:
 
-- `since`: إلزامي، بداية المدى الزمنية inclusive بصيغة ISO 8601.
-- `until`: إلزامي، نهاية المدى الزمنية exclusive بصيغة ISO 8601.
-- `bucket`: إلزامي؛ إحدى القيم `1m` أو`5m` أو `1h` أو `1d`.
-- `group_by`: اختياري؛ `service` أو `level` فقط.
+- `since`: required, inclusive start of the time range in ISO 8601 format.
+- `until`: required, exclusive end of the time range in ISO 8601 format.
+- `bucket`: required; one of `1m`, `5m`, `1h`, or `1d`.
+- `group_by`: optional; `service` or `level` only.
 
-مثال: `/logs/aggregate?since=2026-07-20T14:00:00Z&until=2026-07-20T15:00:00Z&bucket=5m&group_by=service&level=error`.
+Example: `/logs/aggregate?since=2026-07-20T14:00:00Z&until=2026-07-20T15:00:00Z&bucket=5m&group_by=service&level=error`.
 
-يعيد buckets صاعدة زمنيًا؛ عند عدم تقديم `group_by` تكون `group` هي `null`.
+Returns buckets in ascending time order; when `group_by` is omitted, `group` is `null`.
 
-## تصميم قاعدة البيانات والفهارس
+## Database and Index Design
 
-جدول `logs` يستخدم UUID، `timestamptz`، level/service/message النصية، و`jsonb` للـattributes. اختيار JSONB يسمح بتخزين حقول metadata الحرة دون جدول أعمدة متغير، مع بقاء PostgreSQL مصدر الحقيقة.
+The `logs` table uses UUID primary keys, `timestamptz`, text columns for level/service/message, and `jsonb` for attributes. JSONB allows flexible metadata without a wide-column or EAV table while keeping PostgreSQL as the source of truth.
 
-- `(timestamp DESC, id DESC)`: paging وترتيب ثابت.
-- `(service, timestamp DESC, id DESC)` و`(level, timestamp DESC, id DESC)`: الاستعلامات ذات filter شائع.
-- `GIN (attributes jsonb_path_ops)`: filters من `attr.<key>`.
-- `GIN (message gin_trgm_ops)`: البحث الجزئي `q`.
-- `log_second_rollups`: ملخصات transactionally-maintained حسب الثانية/service/level. يستخدمها aggregation عندما لا يوجد `q` أو `attr.*`، ويقرأ الصفوف الخام للحواف الزمنية غير المكتملة وللفلاتر التي لا يمكن تلخيصها؛ لذلك تبقى النتائج دقيقة وPostgreSQL مصدر الحقيقة.
+- `(timestamp DESC, id DESC)`: paging and stable ordering.
+- `(service, timestamp DESC, id DESC)` and `(level, timestamp DESC, id DESC)`: common filtered queries.
+- `GIN (attributes jsonb_path_ops)`: `attr.<key>` filters.
+- `GIN (message gin_trgm_ops)`: partial message search via `q`.
+- `log_second_rollups`: transactionally maintained per-second summaries by service/level. Aggregation uses rollups when there is no `q` or `attr.*` filter, and reads raw rows for incomplete time edges and filters that cannot be summarized; results remain accurate and PostgreSQL remains the source of truth.
 
-تُطبّق هجرة Drizzle الموجودة في `drizzle/0000_initial.sql` عند startup، ولا تُعدّ الخدمة healthy قبل نجاحها. يستخدم ingestion بروتوكول PostgreSQL الأصلي `COPY FROM STDIN` عبر `postgres.js` بدل آلاف معاملات `INSERT`؛ لذلك تُرسل بيانات الـbatch في stream واحد مع backpressure، وتبقى عملية الـCOPY ذرّية: إمّا تُحفظ كل سجلات الـbatch أو لا يُحفظ أي منها.
+The Drizzle migration in `drizzle/0000_initial.sql` is applied at startup; the service does not report healthy until migrations succeed. Ingestion uses the native PostgreSQL `COPY FROM STDIN` protocol via `postgres.js` instead of thousands of `INSERT` parameter bindings; batch data is sent in a single stream with backpressure. Each COPY is atomic: either every log in the batch is stored, or none of them are.
 
 ## Retention
 
-`RETENTION_DAYS` افتراضيها 30. عند البدء ثم كل ساعة، تحذف الخدمة السجلات الأقدم من هذا الحد، وتحدّث ملخصات التجميع في المعاملة نفسها. يمكن ضبط interval عبر `RETENTION_INTERVAL_MS`. لا توجد مصادقة أو rate limiting؛ كلاهما optional وغير مفعّل، كي لا يغيّر عقد الـload generator.
+`RETENTION_DAYS` defaults to 30. On startup and then every hour, the service deletes logs older than this threshold and updates rollup summaries via delete triggers. The interval can be configured with `RETENTION_INTERVAL_MS`. Authentication and rate limiting are optional and disabled by default so they do not alter the load generator contract.
 
-## التحقق والاختبارات
+## Verification and Tests
 
 ```bash
 npm run typecheck
@@ -96,7 +96,7 @@ npm run smoke:test
 TOTAL_LOGS=1000000 BATCH_SIZE=1000 CONCURRENCY=8 npm run load:test
 ```
 
-اختبارات التكامل الاختيارية مستقلة في `scripts/optional-*-integration.ts`. تُشغّل كل واحدة على نسخة مفعّلة من الميزة المقابلة عبر `BASE_URL`:
+Optional integration tests live in `scripts/optional-*-integration.ts`. Run each against a deployment where the corresponding feature is enabled, using `BASE_URL`:
 
 ```bash
 npm run optional:enabled:test     # metrics, dashboard, live tail, dead letters, query language, gzip
@@ -106,48 +106,48 @@ CONTROL_MODE=backpressure npm run optional:controls:test
 npm run optional:alerts:test      # requires ALERT_WEBHOOK_URL=http://host.docker.internal:18089
 ```
 
-تغطي اختبارات الوحدة validation للـbatch وcursor parser والتواريخ غير الموجودة. أما `smoke:test` فيتحقق من المسارات المطلوبة وسلوك batch partial rejection والـcursor وفلترة attributes النصية وaggregation الإلزامي بـ`5m`. يولّد `load:test` batches متوازية ويشغّل aggregation مرة كل ثانية، ثم يطبع معدل الإدخال وp50/p95. افتراضيًا تستخدم السكربتات `127.0.0.1:8080` لتجنب اختلاف localhost/IPv6 على Windows، ويمكن تغييرها عبر `BASE_URL`.
+Unit tests cover batch validation, the cursor parser, and invalid calendar dates. `smoke:test` verifies required routes, batch partial rejection, cursor pagination, string attribute filtering, and mandatory `5m` aggregation. `load:test` generates parallel batches and runs aggregation once per second, then prints ingestion rate and p50/p95 latencies. Scripts default to `127.0.0.1:8080` to avoid localhost/IPv6 differences on Windows; override with `BASE_URL`.
 
-### نتائج قياس فعلية
+### Measured Performance Results
 
-تم القياس على Windows مع Docker Desktop، في قاعدة PostgreSQL نظيفة ومعزولة، وبحدود Compose: التطبيق `0.5 CPU` و`256 MB`، وPostgreSQL `1 CPU` و`1 GB`.
+Benchmarks were run on Windows with Docker Desktop, a clean isolated PostgreSQL database, and Compose limits: application `0.5 CPU` and `256 MB`, PostgreSQL `1 CPU` and `1 GB`.
 
-| المقياس | النتيجة |
+| Metric | Result |
 | --- | ---: |
-| حجم البيانات | 1,000,000 سجل |
-| حجم الـbatch | 1,000 سجل |
-| التوازي | 8 طلبات |
-| السجلات المقبولة | 1,000,000 (دون رفض) |
-| معدل الإدخال | 18,665.16 سجل/ثانية |
-| Ingestion p50 | 396.27 ms للـbatch |
-| Ingestion p95 | 775.17 ms للـbatch |
+| Dataset size | 1,000,000 records |
+| Batch size | 1,000 records |
+| Concurrency | 8 requests |
+| Accepted records | 1,000,000 (zero rejections) |
+| Ingestion rate | 18,665.16 records/second |
+| Ingestion p50 | 396.27 ms per batch |
+| Ingestion p95 | 775.17 ms per batch |
 | Aggregation p50 | 97.36 ms |
 | Aggregation p95 | 699.84 ms |
-| ذروة التطبيق المُراقبة | 39.56% CPU، 84.89 MiB RAM |
-| ذروة PostgreSQL المُراقبة | 105.01% CPU، 693.70 MiB RAM |
+| Observed application peak | 39.56% CPU, 84.89 MiB RAM |
+| Observed PostgreSQL peak | 105.01% CPU, 693.70 MiB RAM |
 
-تحقق القياس من هدف الإدخال الأدنى (`15,000 log/sec`) ومن هدف p95 للتجميع (أقل من ثانية). سُجلت قمم الموارد عبر `docker stats` أثناء حمل متوازٍ؛ بقيت الذاكرة ضمن الحدود المفروضة للحاويتين.
+These results meet the minimum ingestion target (`15,000 log/sec`) and the aggregation p95 target (under one second). Resource peaks were recorded with `docker stats` under concurrent load; memory stayed within the imposed limits for both containers.
 
-## ملاحظات الأداء والحدود
+## Performance Notes and Limitations
 
-أبرز bottleneck مكتشف كان إدخال rows عبر `INSERT` متعدد القيم تحت حمل متوازٍ؛ تم استبداله بـ`COPY FROM STDIN`. كما أن تجميع الصفوف الخام أثناء الإدخال يضغط على PostgreSQL، لذلك أضيفت ملخصات حسب الثانية مع fallback دقيق للصفوف الخام عند الحواف والفلاتر النصية/السمات. الفهارس الموجودة تحافظ على سرعة الفلاتر والـcursor، لكنها تضيف كلفة كتابة طبيعية. الاستعلامات النصية `q` والفلاتر على attributes غير شائعة هي الأعلى كلفة، لذلك تستخدم الخدمة فهرس GIN للـtrigram وفهرس GIN للـJSONB، ويفرض aggregation مدىً زمنيًا إلزاميًا لتفادي مسح غير مقيد للجدول.
+The primary bottleneck identified was multi-value `INSERT` under concurrent load; it was replaced with `COPY FROM STDIN`. Maintaining raw-row rollups on every insert also pressures PostgreSQL, so per-second summaries were added with an accurate raw-row fallback for time edges and text/attribute filters. Existing indexes keep filter and cursor queries fast but add natural write overhead. Text search via `q` and uncommon attribute filters are the most expensive paths; the service uses a GIN trigram index on `message` and a GIN index on `attributes`, and aggregation requires a mandatory time range to avoid unrestricted table scans.
 
-## الميزات الاختيارية وCI
+## Optional Features and CI
 
-لا توجد ميزات اختيارية مفعلة: لا authentication، ولا API keys، ولا multi-tenancy، ولا rate limiting، ولا quota. لذلك تتجاهل الخدمة أي `Authorization` header وتعمل الواجهات الأربع دون إعداد مسبق عبر `docker compose up`.
+No optional features are enabled by default: no authentication, API keys, multi-tenancy, rate limiting, or quota. The service ignores any `Authorization` header and serves all four required endpoints without prior configuration via `docker compose up`.
 
-يتضمن المشروع `smoke:test` لعقد الـAPI و`load:test` لقياس الأداء. يشغّل GitHub Actions في `.github/workflows/ci.yml` فحص الأنواع واختبارات الوحدة، ثم يبني Docker Compose ويشغّل smoke test في وضعي unauthenticated وauthentication مع مفتاح مزروع. والـload test يُشغّل يدويًا لأنه اختبار مليون سجل مكلف زمنيًا.
+The project includes `smoke:test` for the API contract and `load:test` for performance measurement. GitHub Actions in `.github/workflows/ci.yml` runs type checking and unit tests, then builds Docker Compose and runs the smoke test in both unauthenticated and authenticated modes with a seeded key. The load test is run manually because the one-million-record benchmark is time-intensive.
 
-### الميزات الاختيارية
+### Optional Features
 
-كل الميزات التالية additive ولا تغيّر شكل أو نجاح الواجهات المطلوبة عند تشغيل `docker compose up` بلا إعدادات:
+All of the following are additive and do not change the shape or success semantics of the required endpoints when running `docker compose up` with no configuration:
 
-- **Authentication وmulti-tenancy**: معطّلة افتراضيًا عبر `AUTH_ENABLED=false`. عند `AUTH_ENABLED=true` و`LOADGEN_API_KEY=<key>` تُزرع المفتاح تلقائيًا بصلاحيات ingest/query ضمن tenant `loadgen`. يدعم `Authorization: Bearer <key>` و`X-API-Key`؛ يبقى `/health` عامًا، وتحمي المصادقة بقية المسارات.
-- **Rate limiting**: معطّل عبر `RATE_LIMIT_ENABLED=false`. فعّله مع `RATE_LIMIT_REQUESTS` (الافتراضي 1000 طلب/دقيقة)؛ المفتاح المزروع لمولد الحمل معفى منه.
-- **Backpressure**: معطّل عبر `BACKPRESSURE_ENABLED=false`. عند تفعيله يحد `MAX_CONCURRENT_INGESTIONS` (الافتراضي 16) ويرد `503` و`Retry-After` بدل فقد السجلات.
-- **Dead letters**: معطّلة عبر `DEAD_LETTER_ENABLED=false`. عند تفعيلها تُحفظ السجلات المرفوضة وأسبابها في جدول `dead_letters` من دون تغيير استجابة `POST /logs`.
-- **Metrics وdashboard**: `/metrics` يعرض عدادات Prometheus عند `METRICS_ENABLED=true` (افتراضيًا false)، و`/dashboard` يعرض لوحة تشغيل خفيفة.
-- **Live tail**: `/logs/tail` هو SSE للسجلات المقبولة حديثًا، ويعطّل عبر `LIVE_TAIL_ENABLED=false`.
-- **Alert webhook**: معطّل عبر `ALERTS_ENABLED=false`. يتطلب `ALERT_WEBHOOK_URL` ويدفع حدثًا عند بلوغ `ALERT_ERROR_THRESHOLD` (الافتراضي 1) من سجلات error ضمن batch.
-- **Custom query language**: استخدم المعامل الإضافي `query` مثل `query=service:checkout level:error attr.region:eu q:declined` في `/logs` أو `/logs/aggregate`؛ يبقى استعمال المعاملات القياسية كما هو.
-- **Compression**: معطّل عبر `COMPRESSION_ENABLED=false`. عند تفعيله يضغط استجابات أكبر من 1KiB بـgzip فقط عندما يطلب العميل `Accept-Encoding: gzip`.
+- **Authentication and multi-tenancy**: disabled by default via `AUTH_ENABLED=false`. When `AUTH_ENABLED=true` and `LOADGEN_API_KEY=<key>` are set, the key is seeded automatically at startup with ingest/query scopes under tenant `loadgen`. Supports `Authorization: Bearer <key>` and `X-API-Key`; `/health` remains public; authentication protects all other routes.
+- **Rate limiting**: disabled via `RATE_LIMIT_ENABLED=false`. Enable with `RATE_LIMIT_REQUESTS` (default 1000 requests/minute); the seeded load generator key is exempt.
+- **Backpressure**: disabled via `BACKPRESSURE_ENABLED=false`. When enabled, caps concurrent ingestions with `MAX_CONCURRENT_INGESTIONS` (default 16) and responds with `503` and `Retry-After` instead of dropping logs silently.
+- **Dead letters**: disabled via `DEAD_LETTER_ENABLED=false`. When enabled, rejected entries and their reasons are stored in `dead_letters` without changing the `POST /logs` response shape.
+- **Metrics and dashboard**: `/metrics` exposes Prometheus counters when `METRICS_ENABLED=true` (default false); `/dashboard` serves a lightweight operations UI.
+- **Live tail**: `/logs/tail` is an SSE stream of recently accepted logs; disabled via `LIVE_TAIL_ENABLED=false`.
+- **Alert webhook**: disabled via `ALERTS_ENABLED=false`. Requires `ALERT_WEBHOOK_URL` and fires when a batch contains at least `ALERT_ERROR_THRESHOLD` error-level logs (default 1).
+- **Custom query language**: use the additional `query` parameter, e.g. `query=service:checkout level:error attr.region:eu q:declined` on `/logs` or `/logs/aggregate`; standard query parameters remain fully supported.
+- **Compression**: disabled via `COMPRESSION_ENABLED=false`. When enabled, compresses responses larger than 1 KiB with gzip only when the client sends `Accept-Encoding: gzip`.
