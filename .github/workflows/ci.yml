@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  required-contract:
+    strategy:
+      matrix:
+        auth: ["false", "true"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: AUTH_ENABLED=${{ matrix.auth }} LOADGEN_API_KEY=ci-loadgen-key docker compose up --build --detach
+      - run: AUTH_TOKEN=${{ matrix.auth == 'true' && 'ci-loadgen-key' || '' }} AUTH_EXPECTED=${{ matrix.auth }} npm run smoke:test
+      - if: always()
+        run: docker compose down --volumes --remove-orphans

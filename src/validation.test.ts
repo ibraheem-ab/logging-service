@@ -1,0 +1,48 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { decodeCursor, encodeCursor } from "./cursor.js";
+import { ApiError } from "./errors.js";
+import { parseAggregateQuery, parseLogsQuery, validateIngestionBatch } from "./validation.js";
+
+test("accepts valid logs and reports invalid entries independently", () => {
+  const result = validateIngestionBatch({ logs: [
+    { timestamp: "2020-08-09T10:00:00Z", level: "info", service: "api", message: "started", attributes: { region: "eu", retries: 2 } },
+    { timestamp: "2020-08-09T10:00:00Z", level: "critical", service: "api", message: "invalid" },
+  ] });
+  assert.equal(result.validLogs.length, 1);
+  assert.deepEqual(result.rejected, [{ index: 1, reason: "invalid level: 'critical'" }]);
+});
+
+test("cursor round trip preserves deterministic ordering fields", () => {
+  const cursor = { timestamp: new Date("2026-08-09T10:00:00.000Z"), id: "00000000-0000-4000-8000-000000000001" };
+  assert.deepEqual(decodeCursor(encodeCursor(cursor)), cursor);
+});
+
+test("query parser validates filters and limits", () => {
+  const result = parseLogsQuery({ limit: "25", level: "error", "attr.region": "eu", since: "2026-08-01T00:00:00Z" });
+  assert.equal(result.limit, 25);
+  assert.equal(result.level, "error");
+  assert.equal(result.attributes.region, "eu");
+});
+
+test("aggregation requires a time range and accepts the required 5m bucket", () => {
+  assert.throws(() => parseAggregateQuery({ bucket: "1m" }), ApiError);
+  const result = parseAggregateQuery({
+    since: "2026-08-09T10:00:00Z",
+    until: "2026-08-09T11:00:00Z",
+    bucket: "5m",
+    group_by: "service",
+  });
+  assert.equal(result.bucket, "5m");
+  assert.equal(result.groupBy, "service");
+});
+
+test("rejects ISO-shaped timestamps with invalid calendar values", () => {
+  const result = validateIngestionBatch({ logs: [
+    { timestamp: "2026-02-30T10:00:00Z", level: "info", service: "api", message: "invalid date" },
+    { timestamp: "2026-04-31T10:00:00Z", level: "info", service: "api", message: "invalid date" },
+  ] });
+  assert.equal(result.validLogs.length, 0);
+  assert.equal(result.rejected.length, 2);
+  assert.throws(() => parseLogsQuery({ since: "2026-02-30T10:00:00Z" }), ApiError);
+});

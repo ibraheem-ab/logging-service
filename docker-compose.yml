@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: logging
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d logging"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - logging_network
+    cpus: 1.0
+    mem_limit: 1g
+
+  app:
+    build: .
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/logging
+      DATABASE_POOL_SIZE: 10
+      RETENTION_DAYS: 30
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      LOADGEN_API_KEY: ${LOADGEN_API_KEY:-}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-false}
+      RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-1000}
+      BACKPRESSURE_ENABLED: ${BACKPRESSURE_ENABLED:-false}
+      MAX_CONCURRENT_INGESTIONS: ${MAX_CONCURRENT_INGESTIONS:-16}
+      DEAD_LETTER_ENABLED: ${DEAD_LETTER_ENABLED:-false}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      LIVE_TAIL_ENABLED: ${LIVE_TAIL_ENABLED:-true}
+      ALERTS_ENABLED: ${ALERTS_ENABLED:-false}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ALERT_ERROR_THRESHOLD: ${ALERT_ERROR_THRESHOLD:-1}
+      COMPRESSION_ENABLED: ${COMPRESSION_ENABLED:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    networks:
+      - logging_network
+    cpus: 0.5
+    mem_limit: 256m
+
+volumes:
+  postgres_data:
+
+networks:
+  logging_network:
+    driver: bridge
