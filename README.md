@@ -106,11 +106,23 @@ CONTROL_MODE=backpressure npm run optional:controls:test
 npm run optional:alerts:test      # requires ALERT_WEBHOOK_URL=http://host.docker.internal:18089
 ```
 
+Each optional test is deliberately separate because the baseline Compose configuration keeps every optional feature off. Start a dedicated deployment (or restart Compose between tests) with the required settings below:
+
+| Test | Required environment settings |
+| --- | --- |
+| `optional:enabled:test` | `METRICS_ENABLED=true LIVE_TAIL_ENABLED=true COMPRESSION_ENABLED=true DEAD_LETTER_ENABLED=true` |
+| `optional:auth:test` | `AUTH_ENABLED=true METRICS_ENABLED=true` |
+| `CONTROL_MODE=rate optional:controls:test` | `RATE_LIMIT_ENABLED=true RATE_LIMIT_REQUESTS=1` |
+| `CONTROL_MODE=backpressure optional:controls:test` | `BACKPRESSURE_ENABLED=true MAX_CONCURRENT_INGESTIONS=1` |
+| `optional:alerts:test` | `ALERTS_ENABLED=true ALERT_ERROR_THRESHOLD=1 ALERT_WEBHOOK_URL=http://host.docker.internal:18089` |
+
+`optional:auth:test` creates its tenant-A, tenant-B, and ingest-only test keys before it runs, then removes them in `finally`. It connects directly to PostgreSQL when available and otherwise uses `docker compose exec`; this fixture does not alter the production startup behavior, which seeds only `LOADGEN_API_KEY`.
+
 Unit tests cover batch validation, the cursor parser, and invalid calendar dates. `smoke:test` verifies required routes, batch partial rejection, cursor pagination, string attribute filtering, and mandatory `5m` aggregation. `load:test` generates parallel batches and runs aggregation once per second, then prints ingestion rate and p50/p95 latencies. Scripts default to `127.0.0.1:8080` to avoid localhost/IPv6 differences on Windows; override with `BASE_URL`.
 
 ### Measured Performance Results
 
-Benchmarks were run on Windows with Docker Desktop, a clean isolated PostgreSQL database, and Compose limits: application `0.5 CPU` and `256 MB`, PostgreSQL `1 CPU` and `1 GB`.
+The latest acceptance benchmark was run on Windows with Docker Desktop under the Compose limits: application `0.5 CPU` and `256 MB`, PostgreSQL `1 CPU` and `1 GB`.
 
 | Metric | Result |
 | --- | ---: |
@@ -118,15 +130,19 @@ Benchmarks were run on Windows with Docker Desktop, a clean isolated PostgreSQL 
 | Batch size | 1,000 records |
 | Concurrency | 8 requests |
 | Accepted records | 1,000,000 (zero rejections) |
-| Ingestion rate | 32,240.62 records/second |
-| Ingestion p50 | 217.93 ms per batch |
-| Ingestion p95 | 391.44 ms per batch |
-| Aggregation p50 | 88.34 ms |
-| Aggregation p95 | 501.24 ms |
-| Observed application peak | 39.56% CPU, 84.89 MiB RAM |
-| Observed PostgreSQL peak | 105.01% CPU, 693.70 MiB RAM |
+| Ingestion rate | 19,907.45 records/second |
+| Ingestion p50 | 292.53 ms per batch |
+| Ingestion p95 | 1,167.31 ms per batch |
+| Aggregation p50 | 61.09 ms |
+| Aggregation p95 | 255.49 ms |
+| Observed application peak (comparable run) | 39.56% CPU, 84.89 MiB RAM |
+| Observed PostgreSQL peak (comparable run) | 105.01% CPU, 693.70 MiB RAM |
 
-These results exceed the minimum ingestion target (`15,000 log/sec`) and meet the aggregation p95 target (under one second). Resource peaks below were recorded with `docker stats` during a comparable concurrent load on the same environment; memory stayed within the imposed limits for both containers.
+These results exceed the minimum ingestion target (`15,000 log/sec`) and meet the aggregation p95 target (under one second). The resource peaks listed in the table were recorded with `docker stats` during a comparable concurrent load on the same environment; memory stayed within the imposed limits for both containers.
+
+## Repository Hygiene
+
+`.env` and `node_modules` are intentionally excluded from Git. Copy `.env.example` to `.env` only for local development; never commit real keys, webhooks, or credentials. Docker uses `.dockerignore` separately to keep local files out of the image build context.
 
 ## Performance Notes and Limitations
 
