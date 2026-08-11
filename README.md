@@ -118,15 +118,15 @@ Benchmarks were run on Windows with Docker Desktop, a clean isolated PostgreSQL 
 | Batch size | 1,000 records |
 | Concurrency | 8 requests |
 | Accepted records | 1,000,000 (zero rejections) |
-| Ingestion rate | 18,665.16 records/second |
-| Ingestion p50 | 396.27 ms per batch |
-| Ingestion p95 | 775.17 ms per batch |
-| Aggregation p50 | 97.36 ms |
-| Aggregation p95 | 699.84 ms |
+| Ingestion rate | 32,240.62 records/second |
+| Ingestion p50 | 217.93 ms per batch |
+| Ingestion p95 | 391.44 ms per batch |
+| Aggregation p50 | 88.34 ms |
+| Aggregation p95 | 501.24 ms |
 | Observed application peak | 39.56% CPU, 84.89 MiB RAM |
 | Observed PostgreSQL peak | 105.01% CPU, 693.70 MiB RAM |
 
-These results meet the minimum ingestion target (`15,000 log/sec`) and the aggregation p95 target (under one second). Resource peaks were recorded with `docker stats` under concurrent load; memory stayed within the imposed limits for both containers.
+These results exceed the minimum ingestion target (`15,000 log/sec`) and meet the aggregation p95 target (under one second). Resource peaks below were recorded with `docker stats` during a comparable concurrent load on the same environment; memory stayed within the imposed limits for both containers.
 
 ## Performance Notes and Limitations
 

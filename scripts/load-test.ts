@@ -1,7 +1,7 @@
 import { performance } from "node:perf_hooks";
 
 const baseUrl = (process.env.BASE_URL ?? "http://127.0.0.1:8080").replace(/\/$/, "");
-const totalLogs = positiveInteger(process.env.TOTAL_LOGS, 100_000);
+const totalLogs = positiveInteger(process.env.TOTAL_LOGS, 1000000);
 const batchSize = positiveInteger(process.env.BATCH_SIZE, 1_000);
 const concurrency = positiveInteger(process.env.CONCURRENCY, 8);
 
