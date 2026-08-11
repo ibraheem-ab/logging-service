@@ -43,9 +43,7 @@ function attributeValueFromQuery(value: string): AttributeValue {
 }
 
 function attributeCondition(key: string, value: string): SQL {
-  // Query parameters are always strings. Match both the literal string and a
-  // scalar JSON interpretation so attr.user_id=42 finds {"user_id":"42"}
-  // as well as {"user_id":42}; both representations are valid at ingestion.
+ 
   const expectedValues = new Set([
     JSON.stringify({ [key]: value }),
     JSON.stringify({ [key]: attributeValueFromQuery(value) }),
