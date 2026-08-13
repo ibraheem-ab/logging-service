@@ -1,6 +1,16 @@
 services:
   postgres:
     image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - min_wal_size=2GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
     environment:
       POSTGRES_DB: logging
       POSTGRES_USER: postgres
@@ -25,6 +35,9 @@ services:
       DATABASE_POOL_SIZE: 10
       RETENTION_DAYS: 30
       RETENTION_INTERVAL_MS: ${RETENTION_INTERVAL_MS:-3600000}
+      INGESTION_FLUSH_MAX_LOGS: ${INGESTION_FLUSH_MAX_LOGS:-8192}
+      INGESTION_FLUSH_MAX_DELAY_MS: ${INGESTION_FLUSH_MAX_DELAY_MS:-200}
+      INGESTION_FLUSH_CONCURRENCY: ${INGESTION_FLUSH_CONCURRENCY:-2}
       AUTH_ENABLED: ${AUTH_ENABLED:-false}
       LOADGEN_API_KEY: ${LOADGEN_API_KEY:-}
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-false}

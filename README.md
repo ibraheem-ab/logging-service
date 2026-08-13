@@ -78,10 +78,10 @@ The `logs` table uses UUID primary keys, `timestamptz`, text columns for level/s
 - `(timestamp DESC, id DESC)`: paging and stable ordering.
 - `(service, timestamp DESC, id DESC)` and `(level, timestamp DESC, id DESC)`: common filtered queries.
 - `GIN (attributes jsonb_path_ops)`: `attr.<key>` filters.
-- `GIN (message gin_trgm_ops)`: partial message search via `q`.
+- `q` remains a correct case-insensitive substring filter. It intentionally scans matching time/service/level candidates rather than maintaining a write-heavy trigram index, prioritizing sustained ingestion throughput.
 - `log_second_rollups`: transactionally maintained per-second summaries by service/level. Aggregation uses rollups when there is no `q` or `attr.*` filter, and reads raw rows for incomplete time edges and filters that cannot be summarized; results remain accurate and PostgreSQL remains the source of truth.
 
-The Drizzle migration in `drizzle/0000_initial.sql` is applied at startup; the service does not report healthy until migrations succeed. Ingestion uses the native PostgreSQL `COPY FROM STDIN` protocol via `postgres.js` instead of thousands of `INSERT` parameter bindings; batch data is sent in a single stream with backpressure. Each COPY is atomic: either every log in the batch is stored, or none of them are.
+The Drizzle migration in `drizzle/0000_initial.sql` is applied at startup; the service does not report healthy until migrations succeed. Ingestion uses the native PostgreSQL `COPY FROM STDIN` protocol via `postgres.js` instead of thousands of `INSERT` parameter bindings. A short server-side micro-batch queue combines concurrent HTTP requests into durable COPY transactions. Each transaction writes the raw logs plus a small grouped per-second **rollup delta** in the same transaction. Aggregation reads the compact rollups and committed deltas together, so new data is immediately counted without competing `UPSERT`s on the same current-second summary rows. Deltas can be compacted transactionally during maintenance without a visibility gap. An HTTP request receives `200` only after both raw logs and its delta commit; all valid entries from that request stay together in one atomic COPY flush. `INGESTION_FLUSH_MAX_LOGS` (default `8192`), `INGESTION_FLUSH_MAX_DELAY_MS` (default `100`), and `INGESTION_FLUSH_CONCURRENCY` (default `1`) tune the flush size, wait time, and maximum concurrent COPY transactions. The default deliberately favors larger serial COPY commits on the constrained PostgreSQL instance; queued requests that have already waited the delay start immediately when the writer becomes free.
 
 ## Retention
 
@@ -93,7 +93,10 @@ The Drizzle migration in `drizzle/0000_initial.sql` is applied at startup; the s
 npm run typecheck
 npm test
 npm run smoke:test
+BASE_URL=http://127.0.0.1:8086 npm run rollup:integration
 TOTAL_LOGS=1000000 BATCH_SIZE=1000 CONCURRENCY=8 npm run load:test
+BASE_URL=http://127.0.0.1:8086 TARGET_LOGS_PER_SECOND=15000 DURATION_SECONDS=30 BATCH_SIZE=32 npm run benchmark:regression
+BASE_URL=http://127.0.0.1:8086 SCENARIO=load BATCH_SIZE=32 npm run benchmark:scenarios
 ```
 
 Optional integration tests live in `scripts/optional-*-integration.ts`. Run each against a deployment where the corresponding feature is enabled, using `BASE_URL`:
@@ -118,9 +121,13 @@ Each optional test is deliberately separate because the baseline Compose configu
 
 `optional:auth:test` creates its tenant-A, tenant-B, and ingest-only test keys before it runs, then removes them in `finally`. It connects directly to PostgreSQL when available and otherwise uses `docker compose exec`; this fixture does not alter the production startup behavior, which seeds only `LOADGEN_API_KEY`.
 
-Unit tests cover batch validation, the cursor parser, and invalid calendar dates. `smoke:test` verifies required routes, batch partial rejection, cursor pagination, string attribute filtering, and mandatory `5m` aggregation. `load:test` generates parallel batches and runs aggregation once per second, then prints ingestion rate and p50/p95 latencies. Scripts default to `127.0.0.1:8080` to avoid localhost/IPv6 differences on Windows; override with `BASE_URL`.
+Unit tests cover batch validation, the cursor parser, invalid calendar dates, manual rollup grouping, and micro-batch queue behavior. `smoke:test` verifies required routes, batch partial rejection, cursor pagination, string attribute filtering, and both raw-filtered and rollup-backed mandatory `5m` aggregation. `load:test` generates parallel batches and runs aggregation once per second, then prints ingestion rate and p50/p95 latencies. Scripts default to `127.0.0.1:8080` to avoid localhost/IPv6 differences on Windows; override with `BASE_URL`.
 
-### Measured Performance Results
+`benchmark:regression` is a rate-scheduled small-batch regression harness for the production benchmark shape. Unlike the throughput-oriented `load:test`, it keeps offering the selected log rate with batches of 32, bounded high request concurrency, one aggregation per second, and periodic read-after-write checks. It reports failures and timeouts as failed throughput instead of silently slowing the sender. It requires an explicit `BASE_URL` so that a high-rate run cannot accidentally target a development database.
+
+`benchmark:scenarios` runs the same client discipline across the full `load`, `stress`, `spike`, and `breakpoint` stage shapes. Select one with `SCENARIO`; it reports a separate result for every stage, including client-shed offers, POST success and latency, aggregation latency, and read-after-write visibility. Run these long scenarios only against an isolated database.
+
+### Previous Large-Batch Baseline
 
 The latest acceptance benchmark was run on Windows with Docker Desktop under the Compose limits: application `0.5 CPU` and `256 MB`, PostgreSQL `1 CPU` and `1 GB`.
 
@@ -138,7 +145,7 @@ The latest acceptance benchmark was run on Windows with Docker Desktop under the
 | Observed application peak (comparable run) | 39.56% CPU, 84.89 MiB RAM |
 | Observed PostgreSQL peak (comparable run) | 105.01% CPU, 693.70 MiB RAM |
 
-These results exceed the minimum ingestion target (`15,000 log/sec`) and meet the aggregation p95 target (under one second). The resource peaks listed in the table were recorded with `docker stats` during a comparable concurrent load on the same environment; memory stayed within the imposed limits for both containers.
+These figures are a prior large-batch baseline. The small-batch micro-batching implementation and `benchmark:regression` harness were added specifically to cover the external benchmark's higher request rate; rerun that harness before quoting a new final performance result. The resource peaks listed in the table were recorded with `docker stats` during a comparable concurrent load on the same environment; memory stayed within the imposed limits for both containers.
 
 ## Repository Hygiene
 
@@ -146,7 +153,7 @@ These results exceed the minimum ingestion target (`15,000 log/sec`) and meet th
 
 ## Performance Notes and Limitations
 
-The primary bottleneck identified was multi-value `INSERT` under concurrent load; it was replaced with `COPY FROM STDIN`. Maintaining raw-row rollups on every insert also pressures PostgreSQL, so per-second summaries were added with an accurate raw-row fallback for time edges and text/attribute filters. Existing indexes keep filter and cursor queries fast but add natural write overhead. Text search via `q` and uncommon attribute filters are the most expensive paths; the service uses a GIN trigram index on `message` and a GIN index on `attributes`, and aggregation requires a mandatory time range to avoid unrestricted table scans.
+The primary bottleneck identified was multi-value `INSERT` under concurrent load; it was replaced with `COPY FROM STDIN`. Maintaining raw-row rollups on every insert also pressures PostgreSQL, so per-second summaries were added with an accurate raw-row fallback for time edges and text/attribute filters. Existing indexes keep filter and cursor queries fast but add natural write overhead. `q` and uncommon attribute filters are the most expensive paths; attributes use a GIN index, while `q` uses a correct raw-row substring filter to avoid a write-heavy trigram index. Aggregation requires a mandatory time range to avoid unrestricted table scans.
 
 ## Optional Features and CI
 

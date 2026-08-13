@@ -36,6 +36,34 @@
       "when": 1786380000000,
       "tag": "0004_tenant_rollups",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786640400000,
+      "tag": "0005_drop_redundant_rollup_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786644000000,
+      "tag": "0006_concurrent_rollup_writes",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786647600000,
+      "tag": "0007_rollup_deltas",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1786651200000,
+      "tag": "0008_drop_message_trigram_index",
+      "breakpoints": true
     }
   ]
 }

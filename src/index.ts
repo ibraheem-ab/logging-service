@@ -1,8 +1,10 @@
 import { app } from "./app.js";
 import { config } from "./config.js";
 import { closeDatabase, runMigrations } from "./db/index.js";
+import { flushRollupDeltas } from "./db/queries.js";
 import { startRetentionJob } from "./services/retention.js";
 import { seedLoadGeneratorKey } from "./services/auth.js";
+import { flushPendingIngestions } from "./services/ingestion-batcher.js";
 
 async function bootstrap() {
   await runMigrations();
@@ -17,6 +19,8 @@ async function bootstrap() {
     console.log(`${signal} received; shutting down.`);
     stopRetentionJob();
     server.close(async () => {
+      await flushPendingIngestions();
+      await flushRollupDeltas();
       await closeDatabase();
       process.exit(0);
     });

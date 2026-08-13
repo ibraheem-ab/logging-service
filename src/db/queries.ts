@@ -1,19 +1,120 @@
 import { and, asc, desc, eq, gte, ilike, lt, lte, or, sql, type SQL } from "drizzle-orm";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { randomUUID } from "node:crypto";
+import type postgres from "postgres";
 import { encodeCursor, type DecodedCursor } from "../cursor.js";
 import type { AggregateQuery, LogQuery } from "../validation.js";
 import { client, db } from "./index.js";
 import { logs, type NewLog } from "./schema.js";
 import type { AttributeValue } from "../types.js";
 
-export async function insertLogs(entries: NewLog[], tenantId = "default") {
-  const copyStream = await client`
-    COPY logs (timestamp, level, service, message, attributes, tenant_id)
-    FROM STDIN
-  `.writable();
+export type LogWrite = { entry: NewLog; tenantId: string };
 
-  await pipeline(Readable.from(entries.map((entry) => toCopyRow(entry, tenantId))), copyStream);
+type PreparedLogWrite = LogWrite & {
+  id: string;
+  timestamp: string;
+  bucketStart: string;
+};
+
+export type RollupWrite = {
+  tenant_id: string;
+  bucket_start: string;
+  service: string;
+  level: string;
+  count: number;
+};
+
+// Shared/exclusive coordination between rollup-delta writes, compaction, and
+// retention. Normal ingestions take a shared lock only for their very short
+// append-and-commit section; retention takes the exclusive form.
+const ROLLUP_MAINTENANCE_LOCK = 78_123_457;
+// PostgreSQL accepts at most 65,535 bound parameters per statement. A grouped
+// row uses five values, so leave ample room below that limit for an oversized
+// but otherwise valid HTTP request.
+const ROLLUP_UPSERT_MAX_ROWS = 10_000;
+const ROLLUP_DELTA_DRAIN_ROWS = 10_000;
+type TransactionSql = postgres.TransactionSql;
+type StoredRollupDelta = Omit<RollupWrite, "bucket_start" | "count"> & {
+  bucket_start: Date | string;
+  count: number | string;
+};
+
+export async function insertLogs(entries: NewLog[], tenantId = "default") {
+  await insertLogWrites(entries.map((entry) => ({ entry, tenantId })));
+}
+
+export async function insertLogWrites(entries: LogWrite[]) {
+  if (entries.length === 0) return;
+  const prepared = entries.map(prepareLogWrite);
+  const copyRows = prepared.map(toCopyRow).join("");
+  const rollups = rollupWrites(prepared);
+
+  await client.begin(async (transaction) => {
+    const copyStream = await transaction`
+      COPY logs (id, timestamp, level, service, message, attributes, tenant_id)
+      FROM STDIN
+    `.writable();
+    await pipeline(Readable.from([copyRows]), copyStream);
+
+    // Append a transactionally-consistent rollup delta instead of contending on
+    // the hot current-second summary row. Aggregate queries include deltas
+    // immediately; the idle-time compactor merges them into the main summary.
+    await transaction`SELECT pg_advisory_xact_lock_shared(${ROLLUP_MAINTENANCE_LOCK}::bigint)`;
+    await appendRollupDeltas(transaction, rollups);
+  });
+}
+
+async function appendRollupDeltas(transaction: TransactionSql, rollups: RollupWrite[]) {
+  for (let offset = 0; offset < rollups.length; offset += ROLLUP_UPSERT_MAX_ROWS) {
+    const chunk = rollups.slice(offset, offset + ROLLUP_UPSERT_MAX_ROWS);
+    await transaction`
+      INSERT INTO log_second_rollup_deltas ${transaction(chunk, ["tenant_id", "bucket_start", "service", "level", "count"])}
+    `;
+  }
+}
+
+async function upsertRollups(transaction: TransactionSql, rollups: RollupWrite[]) {
+  for (let offset = 0; offset < rollups.length; offset += ROLLUP_UPSERT_MAX_ROWS) {
+    const chunk = rollups.slice(offset, offset + ROLLUP_UPSERT_MAX_ROWS);
+    await transaction`
+      INSERT INTO log_second_rollups ${transaction(chunk, ["tenant_id", "bucket_start", "service", "level", "count"])}
+      ON CONFLICT (tenant_id, bucket_start, service, level)
+      DO UPDATE SET count = log_second_rollups.count + EXCLUDED.count
+    `;
+  }
+}
+
+async function compactOneRollupDeltaChunk(transaction: TransactionSql) {
+  const rows = await transaction<StoredRollupDelta[]>`
+    DELETE FROM log_second_rollup_deltas
+    WHERE id IN (
+      SELECT id FROM log_second_rollup_deltas
+      ORDER BY id
+      LIMIT ${ROLLUP_DELTA_DRAIN_ROWS}
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING tenant_id, bucket_start, service, level, count
+  `;
+  if (rows.length === 0) return false;
+  const rollups = mergeRollupWrites(rows.map((row) => ({
+    ...row,
+    bucket_start: row.bucket_start instanceof Date ? row.bucket_start.toISOString() : row.bucket_start,
+    count: Number(row.count),
+  })));
+  await upsertRollups(transaction, rollups);
+  return rows.length === ROLLUP_DELTA_DRAIN_ROWS;
+}
+
+/** Move all accumulated deltas into the compact rollup table without a visibility gap. */
+export async function flushRollupDeltas() {
+  let hasMore = true;
+  while (hasMore) {
+    hasMore = await client.begin(async (transaction) => {
+      await transaction`SELECT pg_advisory_xact_lock_shared(${ROLLUP_MAINTENANCE_LOCK}::bigint)`;
+      return compactOneRollupDeltaChunk(transaction);
+    });
+  }
 }
 
 function escapeCopyField(value: string) {
@@ -24,15 +125,74 @@ function escapeCopyField(value: string) {
     .replace(/\r/g, "\\r");
 }
 
-function toCopyRow(entry: NewLog, tenantId: string) {
-  const timestamp = entry.timestamp instanceof Date ? entry.timestamp.toISOString() : new Date(entry.timestamp ?? Date.now()).toISOString();
+function prepareLogWrite(write: LogWrite): PreparedLogWrite {
+  const timestamp = write.entry.timestamp instanceof Date
+    ? new Date(write.entry.timestamp)
+    : new Date(write.entry.timestamp ?? Date.now());
+  const timestampText = timestamp.toISOString();
+  return {
+    ...write,
+    id: uuidV7(timestamp.getTime()),
+    timestamp: timestampText,
+    bucketStart: new Date(Math.floor(timestamp.getTime() / 1_000) * 1_000).toISOString(),
+  };
+}
+
+function toCopyRow({ entry, tenantId, id, timestamp }: PreparedLogWrite) {
   return [
+    id,
     timestamp,
     entry.level,
     entry.service,
     entry.message,
     JSON.stringify(entry.attributes ?? {}), tenantId,
   ].map((field) => escapeCopyField(String(field))).join("\t") + "\n";
+}
+
+// PostgreSQL's random UUID default is excellent for uniqueness but scatters
+// inserts across every UUID B-tree page. UUIDv7 preserves the UUID API while
+// making IDs generated for current logs append-friendly in the primary and
+// timestamp/id indexes.
+function uuidV7(milliseconds: number) {
+  const timestamp = Math.floor(milliseconds).toString(16).padStart(12, "0").slice(-12);
+  const random = randomUUID().replaceAll("-", "");
+  return `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${random.slice(13, 16)}-${random.slice(16, 20)}-${random.slice(20)}`;
+}
+
+function rollupWrites(entries: PreparedLogWrite[]): RollupWrite[] {
+  return mergeRollupWrites(entries.map(({ entry, tenantId, bucketStart }) => ({
+    tenant_id: tenantId,
+    bucket_start: bucketStart,
+    service: entry.service,
+    level: entry.level,
+    count: 1,
+  })));
+}
+
+function mergeRollupWrites(entries: RollupWrite[]): RollupWrite[] {
+  const grouped = new Map<string, RollupWrite>();
+  for (const entry of entries) {
+    const { tenant_id, bucket_start, service, level, count } = entry;
+    const key = JSON.stringify([tenant_id, bucket_start, service, level]);
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.count += count;
+    } else {
+      grouped.set(key, { tenant_id, bucket_start, service, level, count });
+    }
+  }
+  return [...grouped.values()].sort((left, right) =>
+    left.tenant_id.localeCompare(right.tenant_id)
+    || left.bucket_start.localeCompare(right.bucket_start)
+    || left.service.localeCompare(right.service)
+    || left.level.localeCompare(right.level),
+  );
+}
+
+// Kept as a pure helper so the transaction's summary semantics can be tested
+// without a live PostgreSQL instance.
+export function summarizeRollupWrites(entries: LogWrite[]): RollupWrite[] {
+  return rollupWrites(entries.map(prepareLogWrite));
 }
 
 function attributeValueFromQuery(value: string): AttributeValue {
@@ -116,24 +276,46 @@ async function getRawAggregate(params: AggregateQuery, since = params.since, unt
   return rows.map((row) => ({ start: new Date(row.start).toISOString(), group: row.group as string | null, count: Number(row.count) }));
 }
 
+function rollupWhere(
+  timestamp: SQL,
+  service: SQL,
+  level: SQL,
+  tenant: SQL,
+  params: AggregateQuery,
+  since: Date,
+  until: Date,
+  tenantId: string,
+) {
+  const conditions: SQL[] = [
+    sql`${tenant} = ${tenantId}`,
+    sql`${timestamp} >= ${since.toISOString()}::timestamptz`,
+    sql`${timestamp} < ${until.toISOString()}::timestamptz`,
+  ];
+  if (params.service) conditions.push(sql`${service} = ${params.service}`);
+  if (params.level) conditions.push(sql`${level} = ${params.level}`);
+  return and(...conditions)!;
+}
+
 async function getRollupAggregate(params: AggregateQuery, since: Date, until: Date, tenantId: string): Promise<AggregateRow[]> {
-  const rollupTimestamp = sql`t.bucket_start`;
-  const rollupService = sql`t.service`;
-  const rollupLevel = sql`t.level`;
+  const mainWhere = rollupWhere(sql`t.bucket_start`, sql`t.service`, sql`t.level`, sql`t.tenant_id`, params, since, until, tenantId);
+  const deltaWhere = rollupWhere(sql`d.bucket_start`, sql`d.service`, sql`d.level`, sql`d.tenant_id`, params, since, until, tenantId);
+  const rollupTimestamp = sql`r.bucket_start`;
+  const rollupService = sql`r.service`;
+  const rollupLevel = sql`r.level`;
   const bucket = bucketExpression(rollupTimestamp, params.bucket);
   const group = groupExpression(params.groupBy, rollupService, rollupLevel);
-  const conditions: SQL[] = [
-    sql`t.tenant_id = ${tenantId}`,
-    sql`${rollupTimestamp} >= ${since.toISOString()}::timestamptz`,
-    sql`${rollupTimestamp} < ${until.toISOString()}::timestamptz`,
-  ];
-  if (params.service) conditions.push(sql`${rollupService} = ${params.service}`);
-  if (params.level) conditions.push(sql`${rollupLevel} = ${params.level}`);
-  const where = and(...conditions)!;
   const result = await db.execute(sql`
-    SELECT ${bucket} AS start, ${group} AS "group", sum(t.count)::integer AS count
-    FROM log_second_rollups AS t
-    WHERE ${where}
+    WITH rollup_rows AS (
+      SELECT t.bucket_start, t.service, t.level, t.count
+      FROM log_second_rollups AS t
+      WHERE ${mainWhere}
+      UNION ALL
+      SELECT d.bucket_start, d.service, d.level, d.count
+      FROM log_second_rollup_deltas AS d
+      WHERE ${deltaWhere}
+    )
+    SELECT ${bucket} AS start, ${group} AS "group", sum(r.count)::integer AS count
+    FROM rollup_rows AS r
     GROUP BY ${bucket}, ${group}
     ORDER BY ${bucket}, ${group}
   `);
@@ -169,6 +351,14 @@ export async function getAggregate(params: AggregateQuery, tenantId = "default")
 }
 
 export async function deleteExpiredLogs(cutoff: Date) {
-  const deleted = await client`DELETE FROM logs WHERE timestamp < ${cutoff.toISOString()}::timestamptz`;
-  return deleted.count;
+  return client.begin(async (transaction) => {
+    // Make every delta visible in the compact rollups before the delete trigger
+    // subtracts expired rows. New ingestions hold the shared version of this
+    // advisory lock until their raw rows and deltas commit.
+    await transaction`SELECT pg_advisory_xact_lock(${ROLLUP_MAINTENANCE_LOCK}::bigint)`;
+    let hasMore = true;
+    while (hasMore) hasMore = await compactOneRollupDeltaChunk(transaction);
+    const deleted = await transaction`DELETE FROM logs WHERE timestamp < ${cutoff.toISOString()}::timestamptz`;
+    return deleted.count;
+  });
 }

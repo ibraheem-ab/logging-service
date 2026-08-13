@@ -69,6 +69,11 @@ async function main() {
   const aggregation = await aggregate.json() as { buckets: Array<{ group: string | null; count: number }> };
   assert(aggregation.buckets.some((bucket) => bucket.group === service && bucket.count >= 2), "aggregation contract failed");
 
+  const rollupAggregate = await request(`/logs/aggregate?service=${encodeURIComponent(service)}&since=${encodeURIComponent(aggregateSince)}&until=${encodeURIComponent(aggregateUntil)}&bucket=5m&group_by=service`);
+  assert(rollupAggregate.status === 200, `rollup GET /logs/aggregate returned ${rollupAggregate.status}`);
+  const rollupAggregation = await rollupAggregate.json() as { buckets: Array<{ group: string | null; count: number }> };
+  assert(rollupAggregation.buckets.some((bucket) => bucket.group === service && bucket.count >= 2), "rollup aggregation did not include committed logs");
+
   const invalidQuery = await request("/logs?level=critical");
   assert(invalidQuery.status === 400, "invalid query parameters must return 400");
   const invalidTimestamp = await request("/logs?since=2026-02-30T10%3A00%3A00Z");

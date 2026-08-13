@@ -23,6 +23,12 @@ export const config = {
   retentionDays: positiveInteger(process.env.RETENTION_DAYS, 30),
   retentionIntervalMs: positiveInteger(process.env.RETENTION_INTERVAL_MS, 3_600_000),
   maxBodySize: process.env.MAX_BODY_SIZE ?? "10mb",
+  ingestionFlushMaxLogs: positiveInteger(process.env.INGESTION_FLUSH_MAX_LOGS, 8_192),
+  // Small HTTP batches are deliberately combined before a durable COPY. One
+  // database writer avoids CPU/index contention under the 1-CPU deployment
+  // limit; the queue starts the next eligible batch immediately.
+  ingestionFlushMaxDelayMs: positiveInteger(process.env.INGESTION_FLUSH_MAX_DELAY_MS, 100),
+  ingestionFlushConcurrency: positiveInteger(process.env.INGESTION_FLUSH_CONCURRENCY, 1),
   authEnabled: boolean(process.env.AUTH_ENABLED),
   loadgenApiKey: process.env.LOADGEN_API_KEY,
   rateLimitEnabled: boolean(process.env.RATE_LIMIT_ENABLED),

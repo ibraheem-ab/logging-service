@@ -2,12 +2,13 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { gzipSync } from "node:zlib";
 import { config } from "./config.js";
 import { ApiError } from "./errors.js";
-import { getAggregate, getLogs, insertLogs } from "./db/queries.js";
+import { getAggregate, getLogs } from "./db/queries.js";
 import { parseAggregateQuery, parseLogsQuery, validateIngestionBatch } from "./validation.js";
 import { authenticate, type Principal } from "./services/auth.js";
 import { addTail, metrics, publishTail, recordIngestion, recordRequest } from "./services/observability.js";
 import { allowRequest, beginIngestion, endIngestion, persistDeadLetters } from "./services/ingestion-controls.js";
 import { notifyErrorThreshold } from "./services/alerts.js";
+import { enqueueIngestion } from "./services/ingestion-batcher.js";
 
 export const app = express();
 
@@ -72,7 +73,14 @@ app.use((req, res, next) => {
   if (!beginIngestion(config.backpressureEnabled, config.maxConcurrentIngestions)) {
     return res.set("retry-after", "1").status(503).json({ error: "ingestion queue is full" });
   }
-  res.once("finish", endIngestion);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    endIngestion();
+  };
+  res.once("finish", release);
+  res.once("close", release);
   return next();
 });
 
@@ -90,7 +98,7 @@ app.post("/logs", async (req, res, next) => {
       return res.status(400).json({ accepted: 0, rejected: result.rejected });
     }
 
-    await insertLogs(result.validLogs, principal.tenantId);
+    await enqueueIngestion(principal.tenantId, result.validLogs);
     notifyErrorThreshold(result.validLogs, principal.tenantId);
     recordIngestion(result.validLogs.length, result.rejected.length);
     if (config.liveTailEnabled) publishTail(principal.tenantId, result.validLogs);
@@ -139,6 +147,10 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   }
   if (error instanceof ApiError) {
     return res.status(error.statusCode).json({ error: error.message });
+  }
+  if (typeof error === "object" && error !== null && "status" in error && typeof error.status === "number" && error.status >= 400 && error.status < 500) {
+    const message = "message" in error && typeof error.message === "string" ? error.message : "invalid request";
+    return res.status(error.status).json({ error: message });
   }
 
   console.error("Unhandled request error:", error);
