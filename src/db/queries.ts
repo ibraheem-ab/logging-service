@@ -153,10 +153,11 @@ function toCopyRow({ entry, tenantId, id, timestamp }: PreparedLogWrite) {
 // inserts across every UUID B-tree page. UUIDv7 preserves the UUID API while
 // making IDs generated for current logs append-friendly in the primary and
 // timestamp/id indexes.
-function uuidV7(milliseconds: number) {
+export function uuidV7(milliseconds: number) {
   const timestamp = Math.floor(milliseconds).toString(16).padStart(12, "0").slice(-12);
   const random = randomUUID().replaceAll("-", "");
-  return `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${random.slice(13, 16)}-${random.slice(16, 20)}-${random.slice(20)}`;
+  const variant = (8 | (Number.parseInt(random[3], 16) & 0x3)).toString(16);
+  return `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${random.slice(0, 3)}-${variant}${random.slice(4, 7)}-${random.slice(7, 19)}`;
 }
 
 function rollupWrites(entries: PreparedLogWrite[]): RollupWrite[] {
