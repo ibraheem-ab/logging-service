@@ -237,7 +237,17 @@ export async function getLogs(params: LogQuery, tenantId = "default") {
   const conditions = filterConditions(params);
   conditions.push(eq(logs.tenantId, tenantId));
   if (params.cursor) conditions.push(cursorCondition(params.cursor));
-  const rows = await db.select().from(logs)
+  // Tenant identity is an internal authorization boundary, not part of the
+  // required public log shape. Keep this projection explicit so future schema
+  // columns cannot accidentally leak through the API either.
+  const rows = await db.select({
+    id: logs.id,
+    timestamp: logs.timestamp,
+    level: logs.level,
+    service: logs.service,
+    message: logs.message,
+    attributes: logs.attributes,
+  }).from(logs)
     .where(conditions.length > 0 ? and(...conditions) : undefined)
     .orderBy(desc(logs.timestamp), desc(logs.id))
     .limit(params.limit + 1);
