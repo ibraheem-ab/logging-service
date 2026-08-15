@@ -13,6 +13,9 @@ import { enqueueIngestion } from "./services/ingestion-batcher.js";
 export const app = express();
 
 app.disable("x-powered-by");
+// Cursor pages are dynamic and can be large; calculating an ETag hashes every
+// response body without helping the load-generator contract.
+app.disable("etag");
 app.use((_req, res, next) => { res.on("finish", () => recordRequest(res.statusCode)); next(); });
 app.use((req, res, next) => {
   if (!config.compressionEnabled || !req.acceptsEncodings("gzip")) return next();
