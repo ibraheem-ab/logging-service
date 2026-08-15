@@ -30,6 +30,10 @@ test("query parser validates filters and limits", () => {
   assert.equal(result.attributes.region, "eu");
 });
 
+test("query parser uses the maximum supported page size by default", () => {
+  assert.equal(parseLogsQuery({}).limit, 1_000);
+});
+
 test("aggregation requires a time range and accepts the required 5m bucket", () => {
   assert.throws(() => parseAggregateQuery({ bucket: "1m" }), ApiError);
   const result = parseAggregateQuery({

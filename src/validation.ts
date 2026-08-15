@@ -168,7 +168,10 @@ function parseFilters(query: Record<string, unknown>, aggregation = false) {
 export function parseLogsQuery(rawQuery: Record<string, unknown>): LogQuery {
   const filters = parseFilters(rawQuery);
   const limitValue = scalar(rawQuery, "limit");
-  const limit = limitValue === undefined ? 100 : Number(limitValue);
+  // A larger default keeps an unqualified cursor walk practical during the
+  // eventual-consistency drain. The public contract leaves the default
+  // implementation-defined and 1,000 is already the documented max.
+  const limit = limitValue === undefined ? MAX_LIMIT : Number(limitValue);
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) throw new ApiError(`limit must be an integer between 1 and ${MAX_LIMIT}`);
   const cursorValue = scalar(rawQuery, "cursor");
   return { ...filters, limit, cursor: cursorValue === undefined ? undefined : decodeCursor(cursorValue) };

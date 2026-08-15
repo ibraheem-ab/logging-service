@@ -227,10 +227,11 @@ function filterConditions(params: Omit<LogQuery, "limit" | "cursor">, untilExclu
 }
 
 function cursorCondition(cursor: DecodedCursor): SQL {
-  return or(
-    lt(logs.timestamp, cursor.timestamp),
-    and(eq(logs.timestamp, cursor.timestamp), lt(logs.id, cursor.id)),
-  )!;
+  // A tuple comparison is semantically the same as the expanded OR below,
+  // but PostgreSQL can turn it into an index seek on
+  // (timestamp DESC, id DESC). The OR form instead scans and filters every
+  // already-seen row on later pages, making a full cursor walk quadratic.
+  return sql`(${logs.timestamp}, ${logs.id}) < (${cursor.timestamp.toISOString()}::timestamptz, ${cursor.id}::uuid)`;
 }
 
 export async function getLogs(params: LogQuery, tenantId = "default") {
