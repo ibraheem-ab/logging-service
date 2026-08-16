@@ -127,6 +127,15 @@ Unit tests cover batch validation, the cursor parser, invalid calendar dates, ma
 
 `benchmark:scenarios` runs the same client discipline across the full `load`, `stress`, `spike`, and `breakpoint` stage shapes. Select one with `SCENARIO`; it reports a separate result for every stage, including client-shed offers, POST success and latency, aggregation latency, and read-after-write visibility. Run these long scenarios only against an isolated database.
 
+For a local k6 calibration of the baseline Load shape, install k6 and run:
+
+```powershell
+$env:BASE_URL = "http://127.0.0.1:8080"
+k6 run scripts/k6-local-benchmark.js
+```
+
+It sends batches of 32 at approximately 15,000 logs/second for two minutes, issues one aggregation per second, and then performs a 30-second cursor drain. This is a local reproduction based on the published workload description, not the private grader script.
+
 ### Previous Large-Batch Baseline
 
 The latest acceptance benchmark was run on Windows with Docker Desktop under the Compose limits: application `0.5 CPU` and `256 MB`, PostgreSQL `1 CPU` and `1 GB`.
