@@ -134,7 +134,15 @@ $env:BASE_URL = "http://127.0.0.1:8080"
 k6 run scripts/k6-local-benchmark.js
 ```
 
-Run it against a fresh isolated database. The script schedules at least 15,000 logs/second for two minutes (at least 1,800,000 logs when no work is dropped), issues one aggregation per second, probes the rare `attr.sequence=0` lookup every five seconds while ingestion is active, then performs a deadline-bounded 30-second unfiltered cursor drain. K6 may schedule one extra iteration exactly at the duration boundary; the script therefore requires the target minimum and verifies that the final visible count equals the actual accepted count. It validates every page envelope plus the first/last row and cross-page ordering; inspecting every one of 1.8M rows locally would itself distort the drain timing. It fails locally if the sender drops scheduled work, a POST is not fully accepted, an aggregate fails or exceeds 1s p95, the rare-attribute lookup misses its 20-second deadline, cursor ordering/shape is invalid, or the visible count does not equal the accepted count. `PRE_ALLOCATED_VUS` and `MAX_VUS` can be overridden if the local k6 sender is resource constrained. This is a local reproduction based on the published workload description, not the private grader script.
+Run it against one isolated Compose database, but do **not** reset that database between retained-data runs. Set a unique `BENCHMARK_RUN` for each run and use an explicit `CURSOR_LIMIT`; for example:
+
+```powershell
+$env:BENCHMARK_RUN = "load-1"
+$env:CURSOR_LIMIT = "1000"
+k6 run scripts/k6-local-benchmark.js
+```
+
+The same database may then be reused with another tag such as `stress-1`, so later runs query against the rows retained from earlier ones. Every log carries `attr.benchmark_run=<tag>`. During ingestion, the script issues one aggregation per second, probes the rare tagged `attr.sequence=0` lookup every five seconds, and reads an explicitly limited tagged page every second. Its final 30-second cursor drain keeps both `attr.benchmark_run` and `limit` on **every** page rather than relying on the server default. K6 may schedule one extra iteration exactly at the duration boundary; the script therefore requires the target minimum and verifies that the final visible count equals the actual accepted count. It validates every page envelope plus the first/last row and cross-page ordering; inspecting every one of 1.8M rows locally would itself distort the drain timing. It fails locally if the sender drops scheduled work, a POST is not fully accepted, an aggregate fails or exceeds 1s p95, a tagged query fails while ingestion is active, the rare-attribute lookup misses its 20-second deadline, cursor ordering/shape is invalid, or the visible count does not equal the accepted count. `PRE_ALLOCATED_VUS` and `MAX_VUS` can be overridden if the local k6 sender is resource constrained. This is a local reproduction based on the published workload description and evaluator guidance, not the private grader script.
 
 ### Previous Large-Batch Baseline
 
