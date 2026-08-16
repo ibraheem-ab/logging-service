@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, ilike, inArray, lt, lte, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, ilike, lt, lte, or, sql, type SQL } from "drizzle-orm";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
@@ -271,6 +271,55 @@ function pageResult<T extends { id: string; timestamp: Date }>(rows: T[], limit:
   };
 }
 
+type MaterializedPublicLog = {
+  id: string;
+  timestamp: Date | string;
+  level: string;
+  service: string;
+  message: string;
+  attributes: LogAttributes;
+};
+
+// An ordered scan is efficient when an attribute is common, because the
+// timestamp/id index can stream the first page. For a result set that was
+// proven small, materialize the GIN-filtered rows first and sort that bounded
+// set instead. This avoids constructing a many-thousand-parameter `IN (...)`
+// query on every cursor page while preserving the same order and filters.
+async function getMaterializedAttributePage(conditions: SQL[], limit: number) {
+  const result = await db.execute(sql`
+    WITH filtered AS MATERIALIZED (
+      SELECT "logs"."id", "logs"."timestamp", "logs"."level", "logs"."service", "logs"."message", "logs"."attributes"
+      FROM "logs"
+      WHERE ${and(...conditions)}
+    )
+    SELECT id, timestamp, level, service, message, attributes
+    FROM filtered
+    ORDER BY timestamp DESC, id DESC
+    LIMIT ${limit + 1}
+  `);
+  const rows = result as unknown as MaterializedPublicLog[];
+  return rows.map((row) => ({
+    ...row,
+    timestamp: row.timestamp instanceof Date ? row.timestamp : new Date(row.timestamp),
+  }));
+}
+
+// Count no more than the configured cap without sending up to 20,001 UUIDs
+// through the application just to decide which read plan to use.
+async function boundedAttributeCandidateCount(conditions: SQL[]) {
+  const result = await db.execute(sql`
+    SELECT count(*)::integer AS count
+    FROM (
+      SELECT 1
+      FROM "logs"
+      WHERE ${and(...conditions)}
+      LIMIT ${ATTRIBUTE_FAST_PATH_CANDIDATES + 1}
+    ) AS candidates
+  `);
+  const rows = result as unknown as Array<{ count: number | string }>;
+  return Number(rows[0]?.count ?? 0);
+}
+
 function matchesAttributeFilters(attributes: LogAttributes, requested: Record<string, string>) {
   return Object.entries(requested).every(([key, value]) => {
     const actual = attributes[key];
@@ -306,26 +355,32 @@ export async function getLogs(params: LogQuery, tenantId = "default") {
   // A timestamp/id seek is best for dense attributes, while a rare attr.*
   // lookup can otherwise scan millions of ordered rows before finding a
   // match. Classify only the first page from a tiny ordered sample. A cursor
-  // marked by a proven-small first page keeps using candidates; broad filters
-  // retain the ordinary keyset seek and never pay repeated GIN work.
+  // marked by a proven-small first page keeps using the GIN/materialize path;
+  // broad filters retain the ordinary keyset seek and never pay repeated GIN
+  // work.
   const hasAttributes = Object.keys(params.attributes).length > 0;
   const useCandidateMode = hasAttributes && (
     params.cursor?.attributeCandidateMode === true
     || (!params.cursor && await attributeFiltersLookSparse(params, tenantId, nonAttributeConditions))
   );
   if (useCandidateMode) {
-    const candidates = await db.select({ id: logs.id }).from(logs)
-      .where(and(...conditions))
-      .limit(ATTRIBUTE_FAST_PATH_CANDIDATES + 1);
-    if (candidates.length <= ATTRIBUTE_FAST_PATH_CANDIDATES) {
-      if (candidates.length === 0) return { logs: [], nextCursor: null };
-      const candidateIds = candidates.map((candidate) => candidate.id);
-      const rows = await db.select(publicLogProjection()).from(logs)
-        .where(and(...conditions, inArray(logs.id, candidateIds)))
-        .orderBy(desc(logs.timestamp), desc(logs.id))
-        .limit(params.limit + 1);
-      return pageResult(rows, params.limit, true);
+    // The first page establishes that the full result set is bounded. Later
+    // cursor pages inherit that proof through the opaque cursor, so they can
+    // run a single materialized query instead of repeatedly fetching IDs just
+    // to rediscover the same bound.
+    if (params.cursor?.attributeCandidateMode !== true) {
+      const candidateCount = await boundedAttributeCandidateCount(conditions);
+      if (candidateCount > ATTRIBUTE_FAST_PATH_CANDIDATES) {
+        const rows = await db.select(publicLogProjection()).from(logs)
+          .where(conditions.length > 0 ? and(...conditions) : undefined)
+          .orderBy(desc(logs.timestamp), desc(logs.id))
+          .limit(params.limit + 1);
+        return pageResult(rows, params.limit);
+      }
+      if (candidateCount === 0) return { logs: [], nextCursor: null };
     }
+    const rows = await getMaterializedAttributePage(conditions, params.limit);
+    return pageResult(rows, params.limit, true);
   }
 
   const rows = await db.select(publicLogProjection()).from(logs)
