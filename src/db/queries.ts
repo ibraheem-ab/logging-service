@@ -7,7 +7,7 @@ import { encodeCursor, type DecodedCursor } from "../cursor.js";
 import type { AggregateQuery, LogQuery } from "../validation.js";
 import { client, db } from "./index.js";
 import { logs, type NewLog } from "./schema.js";
-import type { AttributeValue } from "../types.js";
+import type { AttributeValue, LogAttributes } from "../types.js";
 
 export type LogWrite = { entry: NewLog; tenantId: string };
 
@@ -213,13 +213,18 @@ function attributeCondition(key: string, value: string): SQL {
   return conditions.length === 1 ? conditions[0] : or(...conditions)!;
 }
 
-function filterConditions(params: Omit<LogQuery, "limit" | "cursor">, untilExclusive = false): SQL[] {
+function nonAttributeFilterConditions(params: Omit<LogQuery, "limit" | "cursor">, untilExclusive = false): SQL[] {
   const conditions: SQL[] = [];
   if (params.level) conditions.push(eq(logs.level, params.level));
   if (params.service) conditions.push(eq(logs.service, params.service));
   if (params.since) conditions.push(gte(logs.timestamp, params.since));
   if (params.until) conditions.push(untilExclusive ? lt(logs.timestamp, params.until) : lte(logs.timestamp, params.until));
   if (params.q) conditions.push(ilike(logs.message, `%${params.q}%`));
+  return conditions;
+}
+
+function filterConditions(params: Omit<LogQuery, "limit" | "cursor">, untilExclusive = false): SQL[] {
+  const conditions = nonAttributeFilterConditions(params, untilExclusive);
   for (const [key, value] of Object.entries(params.attributes)) {
     conditions.push(attributeCondition(key, value));
   }
@@ -234,8 +239,11 @@ function cursorCondition(cursor: DecodedCursor): SQL {
   return sql`(${logs.timestamp}, ${logs.id}) < (${cursor.timestamp.toISOString()}::timestamptz, ${cursor.id}::uuid)`;
 }
 
-const ATTRIBUTE_FAST_PATH_CANDIDATES = 1_000;
-const ATTRIBUTE_FAST_PATH_MAX_LIMIT = 100;
+// Stay comfortably below PostgreSQL's 65,535 bind-parameter limit while
+// allowing a 1%-scale retained-data filter to paginate through candidates.
+const ATTRIBUTE_FAST_PATH_CANDIDATES = 20_000;
+const ATTRIBUTE_DENSITY_SAMPLE_ROWS = 64;
+const ATTRIBUTE_DENSE_SAMPLE_MATCHES = 8;
 
 function publicLogProjection() {
   // Tenant identity is an internal authorization boundary, not part of the
@@ -251,43 +259,72 @@ function publicLogProjection() {
   };
 }
 
-function pageResult<T extends { id: string; timestamp: Date }>(rows: T[], limit: number) {
+function pageResult<T extends { id: string; timestamp: Date }>(rows: T[], limit: number, attributeCandidateMode = false) {
   const hasNextPage = rows.length > limit;
   const resultLogs = hasNextPage ? rows.slice(0, limit) : rows;
   const lastLog = resultLogs[resultLogs.length - 1];
-  return { logs: resultLogs, nextCursor: hasNextPage && lastLog ? encodeCursor(lastLog) : null };
+  return {
+    logs: resultLogs,
+    nextCursor: hasNextPage && lastLog
+      ? encodeCursor({ ...lastLog, ...(attributeCandidateMode ? { attributeCandidateMode: true as const } : {}) })
+      : null,
+  };
+}
+
+function matchesAttributeFilters(attributes: LogAttributes, requested: Record<string, string>) {
+  return Object.entries(requested).every(([key, value]) => {
+    const actual = attributes[key];
+    return actual === value || actual === attributeValueFromQuery(value);
+  });
+}
+
+async function attributeFiltersLookSparse(
+  params: LogQuery,
+  tenantId: string,
+  nonAttributeConditions: SQL[],
+) {
+  const conditions = [...nonAttributeConditions, eq(logs.tenantId, tenantId)];
+  if (params.cursor) conditions.push(cursorCondition(params.cursor));
+  const sample = await db.select({ attributes: logs.attributes }).from(logs)
+    .where(and(...conditions))
+    .orderBy(desc(logs.timestamp), desc(logs.id))
+    .limit(ATTRIBUTE_DENSITY_SAMPLE_ROWS);
+  const matches = sample.reduce(
+    (count, row) => count + (matchesAttributeFilters(row.attributes, params.attributes) ? 1 : 0),
+    0,
+  );
+  return matches < ATTRIBUTE_DENSE_SAMPLE_MATCHES;
 }
 
 export async function getLogs(params: LogQuery, tenantId = "default") {
+  const nonAttributeConditions = nonAttributeFilterConditions(params);
   const baseConditions = filterConditions(params);
   baseConditions.push(eq(logs.tenantId, tenantId));
   const conditions = [...baseConditions];
   if (params.cursor) conditions.push(cursorCondition(params.cursor));
 
-  // PostgreSQL can prefer the timestamp-order index for a selective attr.*
-  // lookup with a LIMIT. On a large table that plan scans old rows until it
-  // happens to find the attribute, even though the GIN index can locate it in
-  // a handful of pages. Probe a bounded candidate set without ORDER BY first.
-  // Broad attributes hit the bound quickly and keep the normal ordered scan.
-  // Do this on the first page only. Re-probing a broad attribute together
-  // with a deep cursor could itself become a table scan; cursor pages retain
-  // the direct timestamp/id index seek below.
-  if (
-    Object.keys(params.attributes).length > 0
-    && !params.cursor
-    && params.limit <= ATTRIBUTE_FAST_PATH_MAX_LIMIT
-  ) {
+  // A timestamp/id seek is best for dense attributes, while a rare attr.*
+  // lookup can otherwise scan millions of ordered rows before finding a
+  // match. Classify only the first page from a tiny ordered sample. A cursor
+  // marked by a proven-small first page keeps using candidates; broad filters
+  // retain the ordinary keyset seek and never pay repeated GIN work.
+  const hasAttributes = Object.keys(params.attributes).length > 0;
+  const useCandidateMode = hasAttributes && (
+    params.cursor?.attributeCandidateMode === true
+    || (!params.cursor && await attributeFiltersLookSparse(params, tenantId, nonAttributeConditions))
+  );
+  if (useCandidateMode) {
     const candidates = await db.select({ id: logs.id }).from(logs)
-      .where(and(...baseConditions))
+      .where(and(...conditions))
       .limit(ATTRIBUTE_FAST_PATH_CANDIDATES + 1);
     if (candidates.length <= ATTRIBUTE_FAST_PATH_CANDIDATES) {
       if (candidates.length === 0) return { logs: [], nextCursor: null };
       const candidateIds = candidates.map((candidate) => candidate.id);
       const rows = await db.select(publicLogProjection()).from(logs)
-        .where(and(...baseConditions, inArray(logs.id, candidateIds)))
+        .where(and(...conditions, inArray(logs.id, candidateIds)))
         .orderBy(desc(logs.timestamp), desc(logs.id))
         .limit(params.limit + 1);
-      return pageResult(rows, params.limit);
+      return pageResult(rows, params.limit, true);
     }
   }
 

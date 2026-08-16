@@ -10,6 +10,9 @@ const duration = __ENV.DURATION || "2m";
 const requestTimeout = __ENV.REQUEST_TIMEOUT || "10s";
 const benchmarkRun = __ENV.BENCHMARK_RUN || "local-run";
 const cursorLimit = Number(__ENV.CURSOR_LIMIT || 1_000);
+const filteredBucketModulus = Number(__ENV.FILTERED_BUCKET_MODULUS || 100);
+const filteredBucket = Number(__ENV.FILTERED_BUCKET || 0);
+const rawProbeSequence = filteredBucket;
 const filteredQueryIntervalSeconds = Number(__ENV.FILTERED_QUERY_INTERVAL_SECONDS || 1);
 const rawProbeIntervalSeconds = Number(__ENV.RAW_PROBE_INTERVAL_SECONDS || 5);
 const rawProbeVisibilityTimeoutMilliseconds = Number(__ENV.RAW_PROBE_VISIBILITY_TIMEOUT_MS || 20_000);
@@ -33,6 +36,12 @@ if (typeof benchmarkRun !== "string" || benchmarkRun.trim().length === 0) {
 if (!Number.isInteger(cursorLimit) || cursorLimit < 1 || cursorLimit > 10_000) {
   throw new Error("CURSOR_LIMIT must be an integer between 1 and 10000");
 }
+if (!Number.isInteger(filteredBucketModulus) || filteredBucketModulus < 2) {
+  throw new Error("FILTERED_BUCKET_MODULUS must be an integer of at least 2");
+}
+if (!Number.isInteger(filteredBucket) || filteredBucket < 0 || filteredBucket >= filteredBucketModulus) {
+  throw new Error("FILTERED_BUCKET must be an integer within FILTERED_BUCKET_MODULUS");
+}
 if (!Number.isInteger(filteredQueryIntervalSeconds) || filteredQueryIntervalSeconds < 1) {
   throw new Error("FILTERED_QUERY_INTERVAL_SECONDS must be a positive integer");
 }
@@ -50,6 +59,13 @@ const smallerBatchSize = Math.floor(targetLogsPerSecond / requestRate);
 const largerBatchCount = targetLogsPerSecond - smallerBatchSize * requestRate;
 const expectedIngestRequests = requestRate * durationInSeconds;
 const expectedAcceptedLogs = targetLogsPerSecond * durationInSeconds;
+function matchingBucketCount(start, count) {
+  if (count <= 0) return 0;
+  const first = Math.ceil((start - filteredBucket) / filteredBucketModulus);
+  const last = Math.floor((start + count - 1 - filteredBucket) / filteredBucketModulus);
+  return Math.max(0, last - first + 1);
+}
+const expectedFilteredLogs = matchingBucketCount(0, expectedAcceptedLogs);
 const expectedAggregateRequests = durationInSeconds;
 const minimumFilteredQueries = Math.floor(durationInSeconds / filteredQueryIntervalSeconds);
 // K6 can include or exclude an iteration exactly on the duration boundary,
@@ -100,6 +116,7 @@ const rawProbeDuration = new Trend("raw_probe_duration", true);
 const filteredPageSuccess = new Rate("filtered_page_success");
 const completedFilteredPageQueries = new Counter("completed_filtered_page_queries");
 const filteredPageDuration = new Trend("filtered_page_duration", true);
+const acceptedFilteredLogs = new Counter("accepted_filtered_logs");
 const visibleLogs = new Counter("visible_logs");
 const cursorDrainSuccess = new Rate("cursor_drain_success");
 const cursorDrainDuration = new Trend("cursor_drain_duration", true);
@@ -151,6 +168,7 @@ export const options = {
   },
   thresholds: {
     accepted_logs: [`count>=${expectedAcceptedLogs}`],
+    accepted_filtered_logs: [`count>=${expectedFilteredLogs}`],
     completed_ingest_requests: [`count>=${expectedIngestRequests}`],
     completed_aggregate_requests: [`count>=${expectedAggregateRequests}`],
     completed_filtered_page_queries: [`count>=${minimumFilteredQueries}`],
@@ -164,7 +182,7 @@ export const options = {
     filtered_page_duration: ["p(95)<1000"],
     cursor_drain_duration: ["max<30000"],
     cursor_drain_success: ["rate==1"],
-    visible_logs: [`count>=${expectedAcceptedLogs}`],
+    visible_logs: [`count>=${expectedFilteredLogs}`],
     "http_req_failed{endpoint:ingest}": ["rate==0"],
     "http_req_failed{endpoint:aggregate}": ["rate==0"],
     "http_req_failed{endpoint:filtered_page}": ["rate==0"],
@@ -199,6 +217,7 @@ function batch(iteration) {
   const start = logOffsetForIteration(iteration);
   return {
     count,
+    filteredCount: matchingBucketCount(start, count),
     payload: JSON.stringify({
       logs: Array.from({ length: count }, (_, offset) => ({
         timestamp,
@@ -210,6 +229,7 @@ function batch(iteration) {
           sequence: start + offset,
           synthetic: true,
           benchmark_run: benchmarkRun,
+          query_bucket: (start + offset) % filteredBucketModulus,
         },
       })),
     }),
@@ -256,6 +276,7 @@ function filteredLogsUrl(cursor = null, extraAttributes = {}) {
   // the small, fixed query string explicitly while still encoding all values.
   const query = [
     `attr.benchmark_run=${encodeURIComponent(benchmarkRun)}`,
+    `attr.query_bucket=${encodeURIComponent(String(filteredBucket))}`,
     `limit=${encodeURIComponent(String(cursorLimit))}`,
   ];
   for (const [key, value] of Object.entries(extraAttributes)) {
@@ -266,7 +287,9 @@ function filteredLogsUrl(cursor = null, extraAttributes = {}) {
 }
 
 function isTaggedPublicLog(log) {
-  return isPublicLog(log) && log.attributes.benchmark_run === benchmarkRun;
+  return isPublicLog(log)
+    && log.attributes.benchmark_run === benchmarkRun
+    && Number(log.attributes.query_bucket) === filteredBucket;
 }
 
 function hasPageEnvelope(body) {
@@ -287,7 +310,7 @@ export function setup() {
       `BENCHMARK_RUN=${benchmarkRun} already exists. Choose a new run tag; retained earlier data is expected.`,
     );
   }
-  return { expectedAcceptedLogs, benchmarkRun, cursorLimit };
+  return { expectedFilteredLogs, benchmarkRun, cursorLimit };
 }
 
 export function ingest() {
@@ -307,6 +330,7 @@ export function ingest() {
   postSuccess.add(ok);
   if (ok) {
     acceptedLogs.add(request.count);
+    acceptedFilteredLogs.add(request.filteredCount);
   } else if (Array.isArray(body?.rejected)) {
     rejectedLogs.add(body.rejected.length);
   }
@@ -327,7 +351,7 @@ export function aggregate() {
   check(response, { "GET /logs/aggregate returns 200": () => ok });
 }
 
-// Probe the oldest known log from this run while new logs keep arriving. A
+// Probe a known sparse log from this run while new logs keep arriving. A
 // timestamp-order plan would scan a growing number of rows to find it; the
 // service's selective attr.* path should locate it quickly through the GIN
 // index. No extra probe writes are needed, so the final drain count remains
@@ -340,7 +364,7 @@ export function readAfterWrite() {
   while (Date.now() < deadline) {
     const remainingMilliseconds = Math.max(1, deadline - Date.now());
     const timeout = `${Math.min(5_000, requestTimeoutMilliseconds, remainingMilliseconds)}ms`;
-    const response = http.get(filteredLogsUrl(null, { sequence: 0 }), {
+    const response = http.get(filteredLogsUrl(null, { sequence: rawProbeSequence }), {
       timeout,
       tags: { endpoint: "read_after_write" },
     });
@@ -350,7 +374,7 @@ export function readAfterWrite() {
       response.status === 200
       && hasExactKeys(body, ["logs", "next_cursor"])
       && isTaggedPublicLog(firstLog)
-      && Number(firstLog.attributes.sequence) === 0
+      && Number(firstLog.attributes.sequence) === rawProbeSequence
       && Date.now() <= deadline
     ) {
       found = true;
@@ -374,16 +398,31 @@ export function filteredPage() {
     tags: { endpoint: "filtered_page" },
   });
   const body = parseJson(response);
-  const firstLog = body?.logs?.[0];
-  const lastLog = body?.logs?.[body.logs.length - 1];
-  const ok = response.status === 200
-    && hasPageEnvelope(body)
-    && (!firstLog || isTaggedPublicLog(firstLog))
-    && (!lastLog || isTaggedPublicLog(lastLog));
+  const pageIsValid = (page) => {
+    const firstLog = page?.logs?.[0];
+    const lastLog = page?.logs?.[page.logs.length - 1];
+    return hasPageEnvelope(page)
+      && (!firstLog || isTaggedPublicLog(firstLog))
+      && (!lastLog || isTaggedPublicLog(lastLog));
+  };
+  let duration = response.timings.duration;
+  let ok = response.status === 200 && pageIsValid(body);
+
+  // When the first page is full, immediately request one cursor page while
+  // ingestion is still active. This exercises the same explicit filters and
+  // opaque cursor marker that the final drain uses.
+  if (ok && body.next_cursor) {
+    const cursorResponse = http.get(filteredLogsUrl(body.next_cursor), {
+      timeout: requestTimeout,
+      tags: { endpoint: "filtered_page" },
+    });
+    duration += cursorResponse.timings.duration;
+    ok = cursorResponse.status === 200 && pageIsValid(parseJson(cursorResponse));
+  }
   completedFilteredPageQueries.add(1);
-  filteredPageDuration.add(response.timings.duration);
+  filteredPageDuration.add(duration);
   filteredPageSuccess.add(ok);
-  check(response, { "filtered GET /logs returns the tagged page while ingesting": () => ok });
+  check({ ok }, { "filtered GET /logs returns tagged cursor pages while ingesting": (result) => result.ok });
 }
 
 // Runs once after ingestion. It retains the filter and explicit limit on every
@@ -455,8 +494,8 @@ export function teardown(data) {
     pages += 1;
   } while (cursor);
 
-  if (visible < data.expectedAcceptedLogs) {
-    finish(false, `cursor drain count too low: visible=${visible}, expected-at-least=${data.expectedAcceptedLogs}`);
+  if (visible < data.expectedFilteredLogs) {
+    finish(false, `cursor drain count too low: visible=${visible}, expected-at-least=${data.expectedFilteredLogs}`);
     return;
   }
   finish(true, `cursor drain completed: ${visible} visible logs across ${pages} pages`);
@@ -478,6 +517,7 @@ function allThresholdsPassed(data) {
 
 export function handleSummary(data) {
   const accepted = metricCount(data, "accepted_logs");
+  const acceptedFiltered = metricCount(data, "accepted_filtered_logs");
   const completed = metricCount(data, "completed_ingest_requests");
   const aggregates = metricCount(data, "completed_aggregate_requests");
   const filteredPages = metricCount(data, "completed_filtered_page_queries");
@@ -487,11 +527,12 @@ export function handleSummary(data) {
   const drainPassed = metricRate(data, "cursor_drain_success") === 1;
   const passed = allThresholdsPassed(data)
     && accepted >= expectedAcceptedLogs
+    && acceptedFiltered >= expectedFilteredLogs
     && completed >= expectedIngestRequests
     && aggregates >= expectedAggregateRequests
     && filteredPages >= minimumFilteredQueries
     && rawProbes >= minimumRawProbes
-    && visible === accepted
+    && visible === acceptedFiltered
     && dropped === 0
     && drainPassed;
   const lines = [
@@ -503,6 +544,8 @@ export function handleSummary(data) {
     ` Target:                     ${targetLogsPerSecond} logs/s for ${duration}`,
     ` Minimum accepted logs:      ${expectedAcceptedLogs}`,
     ` Accepted logs:              ${accepted}`,
+    ` Expected filtered logs:     ${expectedFilteredLogs}`,
+    ` Accepted filtered logs:     ${acceptedFiltered}`,
     ` Completed ingest POSTs:     ${completed} / at least ${expectedIngestRequests}`,
     ` Completed aggregate GETs:   ${aggregates} / at least ${expectedAggregateRequests}`,
     ` Tagged page GETs:           ${filteredPages} / at least ${minimumFilteredQueries}`,
