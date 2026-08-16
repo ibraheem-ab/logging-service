@@ -1,21 +1,95 @@
 import http from "k6/http";
-import { check } from "k6";
+import { check, sleep } from "k6";
 import { scenario } from "k6/execution";
 import { Counter, Rate, Trend } from "k6/metrics";
 
 const baseUrl = (__ENV.BASE_URL || "http://127.0.0.1:8080").replace(/\/$/, "");
-const batchSize = Number(__ENV.BATCH_SIZE || 32);
+const maximumBatchSize = Number(__ENV.BATCH_SIZE || 32);
 const targetLogsPerSecond = Number(__ENV.TARGET_LOGS_PER_SECOND || 15_000);
 const duration = __ENV.DURATION || "2m";
-const requestRate = Math.ceil(targetLogsPerSecond / batchSize);
 const requestTimeout = __ENV.REQUEST_TIMEOUT || "10s";
+const rawProbeIntervalSeconds = Number(__ENV.RAW_PROBE_INTERVAL_SECONDS || 5);
+const rawProbeVisibilityTimeoutMilliseconds = Number(__ENV.RAW_PROBE_VISIBILITY_TIMEOUT_MS || 20_000);
+
+function durationSeconds(value) {
+  const match = /^(\d+(?:\.\d+)?)(ms|s|m|h)$/.exec(value);
+  if (!match) throw new Error(`Unsupported DURATION value: ${value}`);
+  const multipliers = { ms: 0.001, s: 1, m: 60, h: 3_600 };
+  return Number(match[1]) * multipliers[match[2]];
+}
+
+if (!Number.isInteger(maximumBatchSize) || maximumBatchSize < 1) {
+  throw new Error("BATCH_SIZE must be a positive integer");
+}
+if (!Number.isInteger(targetLogsPerSecond) || targetLogsPerSecond < 1) {
+  throw new Error("TARGET_LOGS_PER_SECOND must be a positive integer");
+}
+if (!Number.isInteger(rawProbeIntervalSeconds) || rawProbeIntervalSeconds < 1) {
+  throw new Error("RAW_PROBE_INTERVAL_SECONDS must be a positive integer");
+}
+if (!Number.isInteger(rawProbeVisibilityTimeoutMilliseconds) || rawProbeVisibilityTimeoutMilliseconds < 1) {
+  throw new Error("RAW_PROBE_VISIBILITY_TIMEOUT_MS must be a positive integer");
+}
+
+const durationInSeconds = durationSeconds(duration);
+const requestTimeoutMilliseconds = durationSeconds(requestTimeout) * 1_000;
+const requestRate = Math.ceil(targetLogsPerSecond / maximumBatchSize);
+const smallerBatchSize = Math.floor(targetLogsPerSecond / requestRate);
+const largerBatchCount = targetLogsPerSecond - smallerBatchSize * requestRate;
+const expectedIngestRequests = requestRate * durationInSeconds;
+const expectedAcceptedLogs = targetLogsPerSecond * durationInSeconds;
+const expectedAggregateRequests = durationInSeconds;
+// K6 can include or exclude an iteration exactly on the duration boundary,
+// depending on scheduler timing. This is the guaranteed minimum; zero dropped
+// iterations verifies that no scheduled work was silently shed.
+const minimumRawProbes = Math.floor(durationInSeconds / rawProbeIntervalSeconds);
+
+if (
+  !Number.isInteger(durationInSeconds)
+  || !Number.isInteger(expectedIngestRequests)
+  || !Number.isInteger(expectedAcceptedLogs)
+  || !Number.isInteger(minimumRawProbes)
+) {
+  throw new Error("DURATION must be a whole number of seconds and align with RAW_PROBE_INTERVAL_SECONDS");
+}
+if (!Number.isFinite(requestTimeoutMilliseconds) || requestTimeoutMilliseconds < 1) {
+  throw new Error("REQUEST_TIMEOUT must be a positive duration");
+}
+
+// Pre-allocate enough sender capacity that k6 does not silently shed offered
+// load while creating more VUs. These affect only the local load generator,
+// never the service under test.
+const maxVUs = Number(
+  __ENV.MAX_VUS || Math.max(1_500, Math.ceil(requestRate * 3.2)),
+);
+const preAllocatedVUs = Number(
+  __ENV.PRE_ALLOCATED_VUS || maxVUs,
+);
+
+if (!Number.isInteger(preAllocatedVUs) || preAllocatedVUs < 1) {
+  throw new Error("PRE_ALLOCATED_VUS must be a positive integer");
+}
+if (!Number.isInteger(maxVUs) || maxVUs < preAllocatedVUs) {
+  throw new Error("MAX_VUS must be an integer greater than or equal to PRE_ALLOCATED_VUS");
+}
 
 const acceptedLogs = new Counter("accepted_logs");
+const completedIngestRequests = new Counter("completed_ingest_requests");
 const rejectedLogs = new Counter("rejected_logs");
 const postSuccess = new Rate("post_success");
+const aggregateSuccess = new Rate("aggregate_success");
+const completedAggregateRequests = new Counter("completed_aggregate_requests");
 const aggregateDuration = new Trend("aggregate_duration", true);
+const rawProbeSuccess = new Rate("raw_probe_success");
+const completedRawProbes = new Counter("completed_raw_probes");
+const rawProbeDuration = new Trend("raw_probe_duration", true);
+const visibleLogs = new Counter("visible_logs");
+const cursorDrainSuccess = new Rate("cursor_drain_success");
+const cursorDrainDuration = new Trend("cursor_drain_duration", true);
+const cursorDrainPages = new Counter("cursor_drain_pages");
 
 export const options = {
+  teardownTimeout: "35s",
   scenarios: {
     ingest: {
       executor: "constant-arrival-rate",
@@ -23,8 +97,8 @@ export const options = {
       rate: requestRate,
       timeUnit: "1s",
       duration,
-      preAllocatedVUs: Number(__ENV.PRE_ALLOCATED_VUS || 100),
-      maxVUs: Number(__ENV.MAX_VUS || 1_000),
+      preAllocatedVUs,
+      maxVUs,
       gracefulStop: "30s",
     },
     aggregate: {
@@ -37,45 +111,144 @@ export const options = {
       maxVUs: 10,
       gracefulStop: "30s",
     },
+    raw_probe: {
+      executor: "constant-arrival-rate",
+      exec: "readAfterWrite",
+      rate: 1,
+      timeUnit: `${rawProbeIntervalSeconds}s`,
+      duration,
+      preAllocatedVUs: 4,
+      maxVUs: 5,
+      gracefulStop: "30s",
+    },
   },
   thresholds: {
+    accepted_logs: [`count>=${expectedAcceptedLogs}`],
+    completed_ingest_requests: [`count>=${expectedIngestRequests}`],
+    completed_aggregate_requests: [`count>=${expectedAggregateRequests}`],
+    completed_raw_probes: [`count>=${minimumRawProbes}`],
     post_success: ["rate==1"],
-    http_req_failed: ["rate<0.01"],
+    aggregate_success: ["rate==1"],
+    aggregate_duration: ["p(95)<1000"],
+    raw_probe_success: ["rate==1"],
+    raw_probe_duration: [`max<${rawProbeVisibilityTimeoutMilliseconds}`],
+    cursor_drain_duration: ["max<30000"],
+    cursor_drain_success: ["rate==1"],
+    visible_logs: [`count>=${expectedAcceptedLogs}`],
+    "http_req_failed{endpoint:ingest}": ["rate==0"],
+    "http_req_failed{endpoint:aggregate}": ["rate==0"],
+    "http_req_failed{endpoint:cursor_drain}": ["rate==0"],
+    checks: ["rate==1"],
+    "dropped_iterations{scenario:ingest}": ["count==0"],
+    "dropped_iterations{scenario:aggregate}": ["count==0"],
+    "dropped_iterations{scenario:raw_probe}": ["count==0"],
   },
 };
 
+// A k6 arrival-rate scheduler requires an integer number of requests per
+// second. Vary only a few 32-log batches to 31 logs, so 469 POSTs/second
+// equals exactly 15,000 logs/second rather than 15,008.
+function batchSizeForIteration(iteration) {
+  const positionWithinSecond = iteration % requestRate;
+  return positionWithinSecond < largerBatchCount ? smallerBatchSize + 1 : smallerBatchSize;
+}
+
+function logOffsetForIteration(iteration) {
+  const completedSeconds = Math.floor(iteration / requestRate);
+  const positionWithinSecond = iteration % requestRate;
+  return completedSeconds * targetLogsPerSecond
+    + positionWithinSecond * smallerBatchSize
+    + Math.min(positionWithinSecond, largerBatchCount);
+}
+
 function batch(iteration) {
   const timestamp = new Date().toISOString();
-  const start = iteration * batchSize;
-  return JSON.stringify({
-    logs: Array.from({ length: batchSize }, (_, offset) => ({
-      timestamp,
-      level: offset % 10 === 0 ? "error" : "info",
-      service: offset % 2 === 0 ? "checkout" : "auth",
-      message: `k6-local-${start + offset}`,
-      attributes: { region: "eu-west", sequence: start + offset, synthetic: true },
-    })),
-  });
+  const count = batchSizeForIteration(iteration);
+  const start = logOffsetForIteration(iteration);
+  return {
+    count,
+    payload: JSON.stringify({
+      logs: Array.from({ length: count }, (_, offset) => ({
+        timestamp,
+        level: offset % 10 === 0 ? "error" : "info",
+        service: offset % 2 === 0 ? "checkout" : "auth",
+        message: `k6-local-${start + offset}`,
+        attributes: { region: "eu-west", sequence: start + offset, synthetic: true },
+      })),
+    }),
+  };
+}
+
+function parseJson(response) {
+  try {
+    return response.json();
+  } catch {
+    return null;
+  }
+}
+
+function hasExactKeys(value, keys) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function isPublicLog(log) {
+  return hasExactKeys(log, ["id", "timestamp", "level", "service", "message", "attributes"])
+    && typeof log.id === "string"
+    && typeof log.timestamp === "string"
+    && Number.isFinite(Date.parse(log.timestamp))
+    && typeof log.level === "string"
+    && typeof log.service === "string"
+    && typeof log.message === "string"
+    && log.attributes !== null
+    && typeof log.attributes === "object"
+    && !Array.isArray(log.attributes);
+}
+
+function orderedAfterOrEqual(previous, current) {
+  const previousTimestamp = Date.parse(previous.timestamp);
+  const currentTimestamp = Date.parse(current.timestamp);
+  if (currentTimestamp < previousTimestamp) return true;
+  return currentTimestamp === previousTimestamp && current.id < previous.id;
+}
+
+export function setup() {
+  const response = http.get(`${baseUrl}/logs?limit=1`, { timeout: requestTimeout });
+  const body = parseJson(response);
+  if (response.status !== 200 || !Array.isArray(body?.logs)) {
+    throw new Error(`Cannot verify an empty database: GET /logs returned HTTP ${response.status}`);
+  }
+  if (body.logs.length !== 0) {
+    throw new Error(
+      "This strict local test requires an empty, isolated database. Use a fresh Compose project.",
+    );
+  }
+  return { expectedAcceptedLogs };
 }
 
 export function ingest() {
-  const response = http.post(`${baseUrl}/logs`, batch(scenario.iterationInTest), {
+  const request = batch(scenario.iterationInTest);
+  const response = http.post(`${baseUrl}/logs`, request.payload, {
     headers: { "content-type": "application/json" },
     timeout: requestTimeout,
     tags: { endpoint: "ingest" },
   });
 
-  const ok = check(response, { "POST /logs returns 200": (result) => result.status === 200 });
+  const body = parseJson(response);
+  completedIngestRequests.add(1);
+  const ok = response.status === 200
+    && Number(body?.accepted) === request.count
+    && Array.isArray(body?.rejected)
+    && body.rejected.length === 0;
   postSuccess.add(ok);
-  if (response.status !== 200) return;
-
-  try {
-    const body = response.json();
-    acceptedLogs.add(Number(body.accepted || 0));
-    rejectedLogs.add(Array.isArray(body.rejected) ? body.rejected.length : 0);
-  } catch {
-    postSuccess.add(false);
+  if (ok) {
+    acceptedLogs.add(request.count);
+  } else if (Array.isArray(body?.rejected)) {
+    rejectedLogs.add(body.rejected.length);
   }
+  check(response, { "POST /logs accepts the complete batch": () => ok });
 }
 
 export function aggregate() {
@@ -84,43 +257,181 @@ export function aggregate() {
     `${baseUrl}/logs/aggregate?since=${encodeURIComponent(new Date(now - 60_000).toISOString())}&until=${encodeURIComponent(new Date(now + 60_000).toISOString())}&bucket=1m&group_by=service`,
     { timeout: requestTimeout, tags: { endpoint: "aggregate" } },
   );
+  const body = parseJson(response);
+  const ok = response.status === 200 && Array.isArray(body?.buckets);
+  completedAggregateRequests.add(1);
   aggregateDuration.add(response.timings.duration);
-  check(response, { "GET /logs/aggregate returns 200": (result) => result.status === 200 });
+  aggregateSuccess.add(ok);
+  check(response, { "GET /logs/aggregate returns 200": () => ok });
 }
 
-// Runs once after ingestion. It intentionally omits limit so this validates
-// the service's default cursor-page policy used by a generic client.
-export function teardown() {
-  const deadline = Date.now() + 30_000;
+// Probe the oldest known log from this run while new logs keep arriving. A
+// timestamp-order plan would scan a growing number of rows to find it; the
+// service's selective attr.* path should locate it quickly through the GIN
+// index. No extra probe writes are needed, so the final drain count remains
+// exactly the scheduled ingestion total.
+export function readAfterWrite() {
+  const startedAt = Date.now();
+  const deadline = startedAt + rawProbeVisibilityTimeoutMilliseconds;
+  let found = false;
+
+  while (Date.now() < deadline) {
+    const remainingMilliseconds = Math.max(1, deadline - Date.now());
+    const timeout = `${Math.min(5_000, requestTimeoutMilliseconds, remainingMilliseconds)}ms`;
+    const response = http.get(`${baseUrl}/logs?attr.sequence=0&limit=1`, {
+      timeout,
+      tags: { endpoint: "read_after_write" },
+    });
+    const body = parseJson(response);
+    const firstLog = body?.logs?.[0];
+    if (
+      response.status === 200
+      && hasExactKeys(body, ["logs", "next_cursor"])
+      && isPublicLog(firstLog)
+      && Number(firstLog.attributes.sequence) === 0
+      && Date.now() <= deadline
+    ) {
+      found = true;
+      break;
+    }
+    sleep(0.1);
+  }
+
+  completedRawProbes.add(1);
+  rawProbeDuration.add(Date.now() - startedAt);
+  rawProbeSuccess.add(found);
+  check({ found }, { "read-after-write finds attr.sequence=0 within 20 seconds": (result) => result.found });
+}
+
+// Runs once after ingestion. It deliberately omits limit, matching a generic
+// cursor client and exercising the service's default page policy.
+export function teardown(data) {
+  const startedAt = Date.now();
+  const deadline = startedAt + 30_000;
+  const seenCursors = new Set();
   let cursor = null;
+  let previousLog = null;
   let visible = 0;
   let pages = 0;
 
+  function finish(success, message) {
+    visibleLogs.add(visible);
+    cursorDrainPages.add(pages);
+    cursorDrainDuration.add(Date.now() - startedAt);
+    cursorDrainSuccess.add(success);
+    (success ? console.log : console.error)(message);
+  }
+
   do {
     if (Date.now() >= deadline) {
-      console.error(`cursor drain timed out after ${visible} visible logs across ${pages} pages`);
+      finish(false, `cursor drain timed out after ${visible} visible logs across ${pages} pages`);
       return;
     }
+    if (cursor && seenCursors.has(cursor)) {
+      finish(false, "cursor drain received a repeated cursor");
+      return;
+    }
+    if (cursor) seenCursors.add(cursor);
+
     const url = cursor ? `${baseUrl}/logs?cursor=${encodeURIComponent(cursor)}` : `${baseUrl}/logs`;
-    const response = http.get(url, { timeout: requestTimeout, tags: { endpoint: "cursor_drain" } });
+    const remainingMilliseconds = Math.max(1, deadline - Date.now());
+    const drainRequestTimeout = `${Math.min(requestTimeoutMilliseconds, remainingMilliseconds)}ms`;
+    const response = http.get(url, { timeout: drainRequestTimeout, tags: { endpoint: "cursor_drain" } });
     if (response.status !== 200) {
-      console.error(`cursor drain returned HTTP ${response.status}`);
+      finish(false, `cursor drain returned HTTP ${response.status}`);
       return;
     }
-    try {
-      const body = response.json();
-      if (!Array.isArray(body.logs) || !(body.next_cursor === null || typeof body.next_cursor === "string")) {
-        console.error("cursor drain received an invalid response shape");
+
+    const body = parseJson(response);
+    if (
+      !hasExactKeys(body, ["logs", "next_cursor"])
+      || !Array.isArray(body.logs)
+      || !(body.next_cursor === null || (typeof body.next_cursor === "string" && body.next_cursor.length > 0))
+      || (body.logs.length === 0 && body.next_cursor !== null)
+    ) {
+      finish(false, "cursor drain received an invalid response shape");
+      return;
+    }
+    if (body.logs.length > 0) {
+      const firstLog = body.logs[0];
+      const lastLog = body.logs[body.logs.length - 1];
+      if (
+        !isPublicLog(firstLog)
+        || !isPublicLog(lastLog)
+        || (previousLog && !orderedAfterOrEqual(previousLog, firstLog))
+        || (body.logs.length > 1 && !orderedAfterOrEqual(firstLog, lastLog))
+      ) {
+        finish(false, "cursor drain received invalid or non-descending log rows");
         return;
       }
-      visible += body.logs.length;
-      cursor = body.next_cursor;
-      pages += 1;
-    } catch {
-      console.error("cursor drain returned invalid JSON");
+      previousLog = lastLog;
+    }
+
+    if (Date.now() > deadline) {
+      finish(false, `cursor drain exceeded its 30-second deadline after ${visible} visible logs`);
       return;
     }
+
+    visible += body.logs.length;
+    cursor = body.next_cursor;
+    pages += 1;
   } while (cursor);
 
-  console.log(`cursor drain completed: ${visible} visible logs across ${pages} pages`);
+  if (visible < data.expectedAcceptedLogs) {
+    finish(false, `cursor drain count too low: visible=${visible}, expected-at-least=${data.expectedAcceptedLogs}`);
+    return;
+  }
+  finish(true, `cursor drain completed: ${visible} visible logs across ${pages} pages`);
+}
+
+function metricCount(data, name) {
+  return Number(data.metrics?.[name]?.values?.count || 0);
+}
+
+function metricRate(data, name) {
+  return Number(data.metrics?.[name]?.values?.rate || 0);
+}
+
+function allThresholdsPassed(data) {
+  return Object.values(data.metrics || {}).every((metric) =>
+    Object.values(metric.thresholds || {}).every((threshold) => threshold.ok),
+  );
+}
+
+export function handleSummary(data) {
+  const accepted = metricCount(data, "accepted_logs");
+  const completed = metricCount(data, "completed_ingest_requests");
+  const aggregates = metricCount(data, "completed_aggregate_requests");
+  const rawProbes = metricCount(data, "completed_raw_probes");
+  const visible = metricCount(data, "visible_logs");
+  const dropped = metricCount(data, "dropped_iterations");
+  const drainPassed = metricRate(data, "cursor_drain_success") === 1;
+  const passed = allThresholdsPassed(data)
+    && accepted >= expectedAcceptedLogs
+    && completed >= expectedIngestRequests
+    && aggregates >= expectedAggregateRequests
+    && rawProbes >= minimumRawProbes
+    && visible === accepted
+    && dropped === 0
+    && drainPassed;
+  const lines = [
+    "",
+    "============================================================",
+    " Local query-drain verification",
+    "============================================================",
+    ` Result:                     ${passed ? "PASS" : "FAIL"}`,
+    ` Target:                     ${targetLogsPerSecond} logs/s for ${duration}`,
+    ` Minimum accepted logs:      ${expectedAcceptedLogs}`,
+    ` Accepted logs:              ${accepted}`,
+    ` Completed ingest POSTs:     ${completed} / at least ${expectedIngestRequests}`,
+    ` Completed aggregate GETs:   ${aggregates} / at least ${expectedAggregateRequests}`,
+    ` Rare-attribute probes:      ${rawProbes} / at least ${minimumRawProbes}`,
+    ` Actual ingestion window:    ${(accepted / durationInSeconds).toFixed(2)} logs/s`,
+    ` Dropped ingest iterations:  ${dropped}`,
+    ` Visible after cursor drain: ${visible}`,
+    ` Cursor drain:               ${drainPassed ? "PASS" : "FAIL"}`,
+    "============================================================",
+    "",
+  ];
+  return { stdout: `${lines.join("\n")}\n` };
 }
