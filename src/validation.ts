@@ -3,7 +3,7 @@ import { ApiError } from "./errors.js";
 import type { NewLog } from "./db/schema.js";
 import { logLevels, type LogAttributes, type LogLevel } from "./types.js";
 
-const MAX_LIMIT = 5_000;
+const MAX_LIMIT = 10_000;
 const ISO_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
 export type LogQuery = {
@@ -170,7 +170,7 @@ export function parseLogsQuery(rawQuery: Record<string, unknown>): LogQuery {
   const limitValue = scalar(rawQuery, "limit");
   // A larger default keeps an unqualified cursor walk practical during the
   // eventual-consistency drain. The public contract leaves the default
-  // implementation-defined and 1,000 is already the documented max.
+  // implementation-defined and is documented in the README.
   const limit = limitValue === undefined ? MAX_LIMIT : Number(limitValue);
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) throw new ApiError(`limit must be an integer between 1 and ${MAX_LIMIT}`);
   const cursorValue = scalar(rawQuery, "cursor");

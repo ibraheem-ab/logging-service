@@ -50,7 +50,7 @@ Supports freely combinable filters: `service`, `level`, `since`, `until`, `q`, a
 
 `attr.<key>` values come from the query string, so `attr.user_id=42` matches both the string value `"42"` and the numeric value `42`; string attributes that look like numbers or booleans are not lost.
 
-`limit` is between 1 and 5000 (default 5000). Results are ordered by `timestamp DESC, id DESC`. Returns:
+`limit` is between 1 and 10000 (default 10000). Results are ordered by `timestamp DESC, id DESC`. Returns:
 
 ```json
 { "logs": [], "next_cursor": null }

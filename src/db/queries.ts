@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, ilike, lt, lte, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, ilike, inArray, lt, lte, or, sql, type SQL } from "drizzle-orm";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
@@ -234,28 +234,68 @@ function cursorCondition(cursor: DecodedCursor): SQL {
   return sql`(${logs.timestamp}, ${logs.id}) < (${cursor.timestamp.toISOString()}::timestamptz, ${cursor.id}::uuid)`;
 }
 
-export async function getLogs(params: LogQuery, tenantId = "default") {
-  const conditions = filterConditions(params);
-  conditions.push(eq(logs.tenantId, tenantId));
-  if (params.cursor) conditions.push(cursorCondition(params.cursor));
+const ATTRIBUTE_FAST_PATH_CANDIDATES = 1_000;
+const ATTRIBUTE_FAST_PATH_MAX_LIMIT = 100;
+
+function publicLogProjection() {
   // Tenant identity is an internal authorization boundary, not part of the
   // required public log shape. Keep this projection explicit so future schema
   // columns cannot accidentally leak through the API either.
-  const rows = await db.select({
+  return {
     id: logs.id,
     timestamp: logs.timestamp,
     level: logs.level,
     service: logs.service,
     message: logs.message,
     attributes: logs.attributes,
-  }).from(logs)
+  };
+}
+
+function pageResult<T extends { id: string; timestamp: Date }>(rows: T[], limit: number) {
+  const hasNextPage = rows.length > limit;
+  const resultLogs = hasNextPage ? rows.slice(0, limit) : rows;
+  const lastLog = resultLogs[resultLogs.length - 1];
+  return { logs: resultLogs, nextCursor: hasNextPage && lastLog ? encodeCursor(lastLog) : null };
+}
+
+export async function getLogs(params: LogQuery, tenantId = "default") {
+  const baseConditions = filterConditions(params);
+  baseConditions.push(eq(logs.tenantId, tenantId));
+  const conditions = [...baseConditions];
+  if (params.cursor) conditions.push(cursorCondition(params.cursor));
+
+  // PostgreSQL can prefer the timestamp-order index for a selective attr.*
+  // lookup with a LIMIT. On a large table that plan scans old rows until it
+  // happens to find the attribute, even though the GIN index can locate it in
+  // a handful of pages. Probe a bounded candidate set without ORDER BY first.
+  // Broad attributes hit the bound quickly and keep the normal ordered scan.
+  // Do this on the first page only. Re-probing a broad attribute together
+  // with a deep cursor could itself become a table scan; cursor pages retain
+  // the direct timestamp/id index seek below.
+  if (
+    Object.keys(params.attributes).length > 0
+    && !params.cursor
+    && params.limit <= ATTRIBUTE_FAST_PATH_MAX_LIMIT
+  ) {
+    const candidates = await db.select({ id: logs.id }).from(logs)
+      .where(and(...baseConditions))
+      .limit(ATTRIBUTE_FAST_PATH_CANDIDATES + 1);
+    if (candidates.length <= ATTRIBUTE_FAST_PATH_CANDIDATES) {
+      if (candidates.length === 0) return { logs: [], nextCursor: null };
+      const candidateIds = candidates.map((candidate) => candidate.id);
+      const rows = await db.select(publicLogProjection()).from(logs)
+        .where(and(...baseConditions, inArray(logs.id, candidateIds)))
+        .orderBy(desc(logs.timestamp), desc(logs.id))
+        .limit(params.limit + 1);
+      return pageResult(rows, params.limit);
+    }
+  }
+
+  const rows = await db.select(publicLogProjection()).from(logs)
     .where(conditions.length > 0 ? and(...conditions) : undefined)
     .orderBy(desc(logs.timestamp), desc(logs.id))
     .limit(params.limit + 1);
-  const hasNextPage = rows.length > params.limit;
-  const resultLogs = hasNextPage ? rows.slice(0, params.limit) : rows;
-  const lastLog = resultLogs[resultLogs.length - 1];
-  return { logs: resultLogs, nextCursor: hasNextPage && lastLog ? encodeCursor(lastLog) : null };
+  return pageResult(rows, params.limit);
 }
 
 type AggregateRow = { start: string; group: string | null; count: number };
