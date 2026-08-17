@@ -16,6 +16,13 @@ export type IngestionQueueOptions = {
   maxConcurrentFlushes?: number;
 };
 
+// A producer which sends one request at a time should not have to pay the
+// whole high-throughput batching window. Keeping this short still gives a
+// second request time to join, while sustained traffic continues to use the
+// configured maxDelayMs window.
+const SPARSE_REQUEST_FLUSH_MAX_DELAY_MS = 20;
+type FlushTimerKind = "normal" | "sparse";
+
 export function createIngestionQueue(
   writer: IngestionWriter,
   options: IngestionQueueOptions,
@@ -25,13 +32,16 @@ export function createIngestionQueue(
   let pendingHead = 0;
   let pendingLogs = 0;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  let flushTimerKind: FlushTimerKind | undefined;
+  let flushTimerGeneration = 0;
   const activeFlushes = new Set<Promise<void>>();
   const maxConcurrentFlushes = options.maxConcurrentFlushes ?? 1;
 
   function clearFlushTimer() {
-    if (!flushTimer) return;
-    clearTimeout(flushTimer);
+    if (flushTimer) clearTimeout(flushTimer);
     flushTimer = undefined;
+    flushTimerKind = undefined;
+    flushTimerGeneration += 1;
   }
 
   function takeFlushBatch() {
@@ -68,8 +78,36 @@ export function createIngestionQueue(
     return pendingHead < pending.length;
   }
 
+  function pendingRequestCount() {
+    return pending.length - pendingHead;
+  }
+
   function shouldFlush() {
     return pendingLogs >= options.maxLogs || oldestPendingAgeMs() >= options.maxDelayMs;
+  }
+
+  function shouldUseSparseFlush() {
+    return pendingRequestCount() === 1 && activeFlushes.size === 0;
+  }
+
+  function armFlushTimer(kind: FlushTimerKind, delayMs: number) {
+    clearFlushTimer();
+    const generation = ++flushTimerGeneration;
+    flushTimerKind = kind;
+    flushTimer = setTimeout(() => {
+      if (generation !== flushTimerGeneration) return;
+      flushTimer = undefined;
+      flushTimerKind = undefined;
+
+      // A second request may have arrived while a sparse timer was pending.
+      // In that case, restore its normal coalescing window rather than forcing
+      // an undersized batch.
+      if (kind === "sparse" && !shouldUseSparseFlush()) {
+        scheduleFlush();
+        return;
+      }
+      startFlushes(true);
+    }, delayMs);
   }
 
   async function flushOneBatch() {
@@ -120,15 +158,15 @@ export function createIngestionQueue(
       return;
     }
 
-    if (
-      hasPending()
-      && activeFlushes.size < maxConcurrentFlushes
-      && !flushTimer
-    ) {
-      flushTimer = setTimeout(() => {
-        flushTimer = undefined;
-        startFlushes(true);
-      }, Math.max(0, options.maxDelayMs - oldestPendingAgeMs()));
+    if (hasPending() && activeFlushes.size < maxConcurrentFlushes) {
+      const kind: FlushTimerKind = shouldUseSparseFlush() ? "sparse" : "normal";
+      if (flushTimer && flushTimerKind === kind) return;
+
+      const remainingDelayMs = Math.max(0, options.maxDelayMs - oldestPendingAgeMs());
+      const delayMs = kind === "sparse"
+        ? Math.min(SPARSE_REQUEST_FLUSH_MAX_DELAY_MS, remainingDelayMs)
+        : remainingDelayMs;
+      armFlushTimer(kind, delayMs);
     }
   }
 

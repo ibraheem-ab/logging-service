@@ -102,14 +102,14 @@ BASE_URL=http://127.0.0.1:8086 SCENARIO=load BATCH_SIZE=32 npm run benchmark:sce
 ### Published local benchmark CLI
 
 When the course's local tester is available, run it from this repository root
-with Docker Desktop already running. The pinned revision below is intentional:
+with Docker Desktop already running. The pinned v0.4.1 revision below is intentional:
 it makes the invocation reproducible while the tester is still being validated
 across operating systems.
 
 ```powershell
-npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#992d9c8" --version
-npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#992d9c8" --compose ./docker-compose.yml --checks-only --seed 6122026
-npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#992d9c8" --compose ./docker-compose.yml --full --seed 6122026 --generator-cpus 2
+npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#b7754e7" --version
+npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#b7754e7" --compose ./docker-compose.yml --checks-only --seed 6122026
+npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#b7754e7" --compose ./docker-compose.yml --full --seed 6122026 --generator-cpus 2
 ```
 
 The CLI starts and tears down Compose itself, applying the evaluated `0.5 CPU /

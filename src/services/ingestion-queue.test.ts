@@ -50,7 +50,79 @@ test("drains pending writes during shutdown instead of waiting for the normal fl
   const accepted = queue.enqueue("default", [log("one")]);
   await queue.flushPending();
   await accepted;
+  await new Promise((resolve) => setTimeout(resolve, 30));
   assert.deepEqual(copies, [1]);
+});
+
+test("flushes a lone request before the high-throughput batching deadline", async () => {
+  let writerStarted!: () => void;
+  const writerStartedPromise = new Promise<void>((resolve) => { writerStarted = resolve; });
+  const queue = createIngestionQueue(async () => { writerStarted(); }, { maxLogs: 100, maxDelayMs: 500 });
+
+  const accepted = queue.enqueue("default", [log("one")]);
+  await Promise.race([
+    writerStartedPromise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("lone request waited for the normal deadline")), 150)),
+  ]);
+  await accepted;
+});
+
+test("restores normal batching when another request joins a sparse request", async () => {
+  const batches: string[][] = [];
+  const queue = createIngestionQueue(async (batch) => {
+    batches.push(batch.map(({ entry }) => entry.message));
+  }, { maxLogs: 100, maxDelayMs: 500 });
+
+  const first = queue.enqueue("default", [log("one")]);
+  const second = queue.enqueue("default", [log("two")]);
+
+  // The original sparse timer would have fired around 20ms. A second request
+  // must cancel it and keep the two requests together.
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.deepEqual(batches, []);
+
+  await queue.flushPending();
+  await Promise.all([first, second]);
+  assert.deepEqual(batches, [["one", "two"]]);
+});
+
+test("does not use sparse flushing while another writer is active", async () => {
+  let invocations = 0;
+  let firstStarted!: () => void;
+  const firstStartedPromise = new Promise<void>((resolve) => { firstStarted = resolve; });
+  let releaseFirst!: () => void;
+  const firstCanFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const queue = createIngestionQueue(async () => {
+    invocations += 1;
+    if (invocations === 1) {
+      firstStarted();
+      await firstCanFinish;
+    }
+  }, { maxLogs: 100, maxDelayMs: 500, maxConcurrentFlushes: 2 });
+
+  const first = queue.enqueue("default", [log("one")]);
+  await firstStartedPromise;
+  const second = queue.enqueue("default", [log("two")]);
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(invocations, 1);
+
+  releaseFirst();
+  await queue.flushPending();
+  await Promise.all([first, second]);
+  assert.equal(invocations, 2);
+});
+
+test("honors a batching deadline shorter than the sparse request delay", async () => {
+  let writerStarted!: () => void;
+  const writerStartedPromise = new Promise<void>((resolve) => { writerStarted = resolve; });
+  const queue = createIngestionQueue(async () => { writerStarted(); }, { maxLogs: 100, maxDelayMs: 1 });
+
+  const accepted = queue.enqueue("default", [log("one")]);
+  await Promise.race([
+    writerStartedPromise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("short batching deadline was ignored")), 40)),
+  ]);
+  await accepted;
 });
 
 test("continues flushing later requests after a failed batch", async () => {
