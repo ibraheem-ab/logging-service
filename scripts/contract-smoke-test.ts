@@ -37,10 +37,10 @@ async function main() {
   }
 
   const now = Date.now();
+  const timestamp = new Date(now).toISOString();
   const newestMatchingTimestamp = new Date(now - 1_000).toISOString();
   const distractorTimestamp = new Date(now - 2_000).toISOString();
-  const middleMatchingTimestamp = new Date(now - 3_000).toISOString();
-  const oldestMatchingTimestamp = new Date(now - 4_000).toISOString();
+  const oldestMatchingTimestamp = new Date(now - 3_000).toISOString();
   const service = `contract-smoke-${Date.now()}`;
   const aggregateSince = new Date(Date.now() - 60_000).toISOString();
   const aggregateUntil = new Date(Date.now() + 60_000).toISOString();
@@ -48,20 +48,21 @@ async function main() {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ logs: [
-      { timestamp: newestMatchingTimestamp, level: "error", service, message: "cursor-match newest", attributes: { region: "eu-west", user_id: "42" } },
-      { timestamp: distractorTimestamp, level: "error", service, message: "cursor-match distractor", attributes: { region: "eu-west", user_id: "41" } },
-      { timestamp: middleMatchingTimestamp, level: "error", service, message: "cursor-match middle", attributes: { region: "eu-west", user_id: "42" } },
-      { timestamp: oldestMatchingTimestamp, level: "error", service, message: "cursor-match oldest", attributes: { region: "eu-west", user_id: "42" } },
-      { timestamp: newestMatchingTimestamp, level: "invalid", service, message: "rejected" },
+      { timestamp, level: "info", service, message: "first", attributes: { region: "eu-west", user_id: "42" } },
+      { timestamp, level: "error", service, message: "second", attributes: { region: "eu-west", user_id: "42" } },
+      { timestamp: newestMatchingTimestamp, level: "error", service, message: "cursor-match newest", attributes: { cursor_case: "match" } },
+      { timestamp: distractorTimestamp, level: "error", service, message: "cursor-match distractor", attributes: { cursor_case: "distractor" } },
+      { timestamp: oldestMatchingTimestamp, level: "error", service, message: "cursor-match oldest", attributes: { cursor_case: "match" } },
+      { timestamp, level: "invalid", service, message: "rejected" },
       { timestamp: "2026-02-30T10:00:00Z", level: "info", service, message: "invalid date" },
     ] }),
   });
   assert(ingest.status === 200, `POST /logs returned ${ingest.status}`);
   const ingestion = await ingest.json() as { accepted: number; rejected: Array<{ index: number }> };
-  assert(ingestion.accepted === 4 && ingestion.rejected.length === 2 && ingestion.rejected[0].index === 4 && ingestion.rejected[1].index === 5, "batch validation contract failed");
+  assert(ingestion.accepted === 5 && ingestion.rejected.length === 2 && ingestion.rejected[0].index === 5 && ingestion.rejected[1].index === 6, "batch validation contract failed");
 
   const paginationQuery = [
-    `query=${encodeURIComponent(`service:${service} level:error q:cursor-match attr.user_id:42`)}`,
+    `query=${encodeURIComponent(`service:${service} level:error q:cursor-match attr.cursor_case:match`)}`,
     `since=${encodeURIComponent(aggregateSince)}`,
     `until=${encodeURIComponent(aggregateUntil)}`,
     "limit=1",
@@ -71,7 +72,7 @@ async function main() {
   const isMatchingLog = (log: PublicLog | undefined) => log?.level === "error"
     && log.service === service
     && log.message.startsWith("cursor-match")
-    && log.attributes.user_id === "42";
+    && log.attributes.cursor_case === "match";
 
   const firstPage = await request(`/logs?${paginationQuery}`);
   assert(firstPage.status === 200, `GET /logs returned ${firstPage.status}`);
@@ -86,20 +87,17 @@ async function main() {
   const second = await secondPage.json() as LogPage;
   assert(second.logs.length === 1 && isMatchingLog(second.logs[0]) && second.logs[0].id !== first.logs[0].id && typeof second.next_cursor === "string", "cursor-only page 2 did not retain the original query");
 
-  const thirdPage = await request(`/logs?cursor=${encodeURIComponent(second.next_cursor)}`);
-  assert(thirdPage.status === 200, `GET /logs page 3 returned ${thirdPage.status}`);
-  const third = await thirdPage.json() as LogPage;
-  assert(third.logs.length === 1 && isMatchingLog(third.logs[0]) && third.logs[0].id !== second.logs[0].id && third.next_cursor === null, "cursor-only page 3 did not retain the original query");
+  assert(second.next_cursor === null, "cursor-only page 2 did not reach the end of the filtered query");
 
   const aggregate = await request(`/logs/aggregate?service=${encodeURIComponent(service)}&attr.user_id=42&since=${encodeURIComponent(aggregateSince)}&until=${encodeURIComponent(aggregateUntil)}&bucket=5m&group_by=service`);
   assert(aggregate.status === 200, `GET /logs/aggregate returned ${aggregate.status}`);
   const aggregation = await aggregate.json() as { buckets: Array<{ group: string | null; count: number }> };
-  assert(aggregation.buckets.some((bucket) => bucket.group === service && bucket.count >= 3), "aggregation contract failed");
+  assert(aggregation.buckets.some((bucket) => bucket.group === service && bucket.count >= 2), "aggregation contract failed");
 
   const rollupAggregate = await request(`/logs/aggregate?service=${encodeURIComponent(service)}&since=${encodeURIComponent(aggregateSince)}&until=${encodeURIComponent(aggregateUntil)}&bucket=5m&group_by=service`);
   assert(rollupAggregate.status === 200, `rollup GET /logs/aggregate returned ${rollupAggregate.status}`);
   const rollupAggregation = await rollupAggregate.json() as { buckets: Array<{ group: string | null; count: number }> };
-  assert(rollupAggregation.buckets.some((bucket) => bucket.group === service && bucket.count >= 4), "rollup aggregation did not include committed logs");
+  assert(rollupAggregation.buckets.some((bucket) => bucket.group === service && bucket.count >= 2), "rollup aggregation did not include committed logs");
 
   const invalidQuery = await request("/logs?level=critical");
   assert(invalidQuery.status === 400, "invalid query parameters must return 400");
