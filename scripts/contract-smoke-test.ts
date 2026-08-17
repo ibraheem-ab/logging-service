@@ -85,9 +85,7 @@ async function main() {
   const secondPage = await request(`/logs?cursor=${encodeURIComponent(first.next_cursor)}`);
   assert(secondPage.status === 200, `GET /logs page 2 returned ${secondPage.status}`);
   const second = await secondPage.json() as LogPage;
-  assert(second.logs.length === 1 && isMatchingLog(second.logs[0]) && second.logs[0].id !== first.logs[0].id && typeof second.next_cursor === "string", "cursor-only page 2 did not retain the original query");
-
-  assert(second.next_cursor === null, "cursor-only page 2 did not reach the end of the filtered query");
+  assert(second.logs.length === 1 && isMatchingLog(second.logs[0]) && second.logs[0].id !== first.logs[0].id && second.next_cursor === null, "cursor-only page 2 did not retain the original query");
 
   const aggregate = await request(`/logs/aggregate?service=${encodeURIComponent(service)}&attr.user_id=42&since=${encodeURIComponent(aggregateSince)}&until=${encodeURIComponent(aggregateUntil)}&bucket=5m&group_by=service`);
   assert(aggregate.status === 200, `GET /logs/aggregate returned ${aggregate.status}`);
