@@ -1,4 +1,4 @@
-import { decodeCursor, type DecodedCursor } from "./cursor.js";
+import { decodeCursor, type CursorFilterContext, type DecodedCursor } from "./cursor.js";
 import { ApiError } from "./errors.js";
 import type { NewLog } from "./db/schema.js";
 import { logLevels, type LogAttributes, type LogLevel } from "./types.js";
@@ -165,16 +165,66 @@ function parseFilters(query: Record<string, unknown>, aggregation = false) {
   return { level: level as LogLevel | undefined, service, since, until, q, attributes };
 }
 
+type ParsedFilters = ReturnType<typeof parseFilters>;
+
+function cursorContextQuery(context: CursorFilterContext): Record<string, unknown> {
+  const query: Record<string, unknown> = {};
+  for (const key of ["level", "service", "since", "until", "q"] as const) {
+    if (context[key] !== undefined) query[key] = context[key];
+  }
+  for (const [key, value] of Object.entries(context.attributes ?? {})) {
+    query[`attr.${key}`] = value;
+  }
+  return query;
+}
+
+function cursorFilterMismatch() {
+  throw new ApiError("cursor does not match query filters");
+}
+
+// A cursor represents a continuation of one logical query. Carrying the
+// original filters in the opaque cursor lets clients safely send only the
+// cursor on later pages, while still accepting clients that repeat matching
+// filters explicitly.
+function mergeCursorFilters(requested: ParsedFilters, saved: ParsedFilters): ParsedFilters {
+  const scalar = <T>(requestedValue: T | undefined, savedValue: T | undefined) => {
+    if (requestedValue !== undefined && savedValue !== undefined && requestedValue !== savedValue) cursorFilterMismatch();
+    if (requestedValue !== undefined && savedValue === undefined) cursorFilterMismatch();
+    return savedValue ?? requestedValue;
+  };
+  const date = (requestedValue: Date | undefined, savedValue: Date | undefined) => {
+    if (requestedValue !== undefined && savedValue !== undefined && requestedValue.getTime() !== savedValue.getTime()) cursorFilterMismatch();
+    if (requestedValue !== undefined && savedValue === undefined) cursorFilterMismatch();
+    return savedValue ?? requestedValue;
+  };
+  const attributes = { ...saved.attributes };
+  for (const [key, value] of Object.entries(requested.attributes)) {
+    if (saved.attributes[key] !== value) cursorFilterMismatch();
+  }
+  return {
+    level: scalar(requested.level, saved.level) as LogLevel | undefined,
+    service: scalar(requested.service, saved.service),
+    since: date(requested.since, saved.since),
+    until: date(requested.until, saved.until),
+    q: scalar(requested.q, saved.q),
+    attributes,
+  };
+}
+
 export function parseLogsQuery(rawQuery: Record<string, unknown>): LogQuery {
-  const filters = parseFilters(rawQuery);
+  const requestedFilters = parseFilters(rawQuery);
+  const cursorValue = scalar(rawQuery, "cursor");
+  const cursor = cursorValue === undefined ? undefined : decodeCursor(cursorValue);
+  const filters = cursor?.filterContext
+    ? mergeCursorFilters(requestedFilters, parseFilters(cursorContextQuery(cursor.filterContext)))
+    : requestedFilters;
   const limitValue = scalar(rawQuery, "limit");
   // A larger default keeps an unqualified cursor walk practical during the
   // eventual-consistency drain. The public contract leaves the default
   // implementation-defined and is documented in the README.
-  const limit = limitValue === undefined ? MAX_LIMIT : Number(limitValue);
+  const limit = limitValue === undefined ? (cursor?.limit ?? MAX_LIMIT) : Number(limitValue);
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) throw new ApiError(`limit must be an integer between 1 and ${MAX_LIMIT}`);
-  const cursorValue = scalar(rawQuery, "cursor");
-  return { ...filters, limit, cursor: cursorValue === undefined ? undefined : decodeCursor(cursorValue) };
+  return { ...filters, limit, cursor };
 }
 
 export function parseAggregateQuery(rawQuery: Record<string, unknown>): AggregateQuery {

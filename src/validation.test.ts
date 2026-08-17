@@ -36,6 +36,56 @@ test("cursor preserves the internal selective-attribute pagination marker", () =
   assert.throws(() => decodeCursor(malformed), ApiError);
 });
 
+test("cursor preserves filter context when later pages omit query filters", () => {
+  const cursor = encodeCursor({
+    timestamp: new Date("2026-08-09T10:00:00.000Z"),
+    id: "0198f7c0-8a00-7a12-8abc-0123456789ab",
+    limit: 100,
+    filterContext: {
+      level: "error",
+      service: "checkout",
+      since: "2026-08-09T09:00:00.000Z",
+      until: "2026-08-09T11:00:00.000Z",
+      q: "declined",
+      attributes: { request_id: "req-42" },
+    },
+  });
+  const continued = parseLogsQuery({ cursor });
+  assert.equal(continued.limit, 100);
+  assert.equal(continued.level, "error");
+  assert.equal(continued.service, "checkout");
+  assert.equal(continued.since?.toISOString(), "2026-08-09T09:00:00.000Z");
+  assert.equal(continued.until?.toISOString(), "2026-08-09T11:00:00.000Z");
+  assert.equal(continued.q, "declined");
+  assert.deepEqual(continued.attributes, { request_id: "req-42" });
+
+  const repeated = parseLogsQuery({
+    cursor,
+    limit: "25",
+    level: "error",
+    service: "checkout",
+    since: "2026-08-09T09:00:00.000Z",
+    until: "2026-08-09T11:00:00.000Z",
+    q: "declined",
+    "attr.request_id": "req-42",
+  });
+  assert.equal(repeated.limit, 25);
+  assert.equal(repeated.service, "checkout");
+  assert.deepEqual(repeated.attributes, { request_id: "req-42" });
+
+  const repeatedExpression = parseLogsQuery({
+    cursor,
+    query: "service:checkout level:error q:declined attr.request_id:req-42",
+  });
+  assert.equal(repeatedExpression.level, "error");
+  assert.equal(repeatedExpression.service, "checkout");
+  assert.equal(repeatedExpression.q, "declined");
+  assert.deepEqual(repeatedExpression.attributes, { request_id: "req-42" });
+
+  assert.throws(() => parseLogsQuery({ cursor, service: "auth" }), ApiError);
+  assert.throws(() => parseLogsQuery({ cursor, "attr.request_id": "other" }), ApiError);
+});
+
 test("query parser validates filters and limits", () => {
   const result = parseLogsQuery({ limit: "25", level: "error", "attr.region": "eu", since: "2026-08-01T00:00:00Z" });
   assert.equal(result.limit, 25);

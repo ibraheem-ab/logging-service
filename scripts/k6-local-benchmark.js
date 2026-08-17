@@ -271,9 +271,10 @@ function orderedAfterOrEqual(previous, current) {
   return currentTimestamp === previousTimestamp && current.id < previous.id;
 }
 
-function filteredLogsUrl(cursor = null, extraAttributes = {}) {
+function filteredLogsUrl(cursor = null, extraAttributes = {}, cursorOnly = false) {
   // k6's JavaScript runtime does not provide URLSearchParams, so construct
   // the small, fixed query string explicitly while still encoding all values.
+  if (cursor && cursorOnly) return `${baseUrl}/logs?cursor=${encodeURIComponent(cursor)}`;
   const query = [
     `attr.benchmark_run=${encodeURIComponent(benchmarkRun)}`,
     `attr.query_bucket=${encodeURIComponent(String(filteredBucket))}`,
@@ -412,7 +413,7 @@ export function filteredPage() {
   // ingestion is still active. This exercises the same explicit filters and
   // opaque cursor marker that the final drain uses.
   if (ok && body.next_cursor) {
-    const cursorResponse = http.get(filteredLogsUrl(body.next_cursor), {
+    const cursorResponse = http.get(filteredLogsUrl(body.next_cursor, {}, true), {
       timeout: requestTimeout,
       tags: { endpoint: "filtered_page" },
     });
@@ -425,8 +426,9 @@ export function filteredPage() {
   check({ ok }, { "filtered GET /logs returns tagged cursor pages while ingesting": (result) => result.ok });
 }
 
-// Runs once after ingestion. It retains the filter and explicit limit on every
-// cursor page, mirroring a client that does not rely on server-side defaults.
+// Runs once after ingestion. The initial page supplies explicit filters and a
+// limit; continuation pages pass only the opaque cursor. This validates both
+// the client's opaque-cursor contract and server-side query continuity.
 export function teardown(data) {
   const startedAt = Date.now();
   const deadline = startedAt + 30_000;
@@ -455,7 +457,7 @@ export function teardown(data) {
     }
     if (cursor) seenCursors.add(cursor);
 
-    const url = filteredLogsUrl(cursor);
+    const url = cursor ? filteredLogsUrl(cursor, {}, true) : filteredLogsUrl();
     const remainingMilliseconds = Math.max(1, deadline - Date.now());
     const drainRequestTimeout = `${Math.min(requestTimeoutMilliseconds, remainingMilliseconds)}ms`;
     const response = http.get(url, { timeout: drainRequestTimeout, tags: { endpoint: "cursor_drain" } });

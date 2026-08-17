@@ -3,7 +3,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
 import type postgres from "postgres";
-import { encodeCursor, type DecodedCursor } from "../cursor.js";
+import { encodeCursor, type CursorFilterContext, type DecodedCursor } from "../cursor.js";
 import type { AggregateQuery, LogQuery } from "../validation.js";
 import { client, db } from "./index.js";
 import { logs, type NewLog } from "./schema.js";
@@ -259,16 +259,38 @@ function publicLogProjection() {
   };
 }
 
-function pageResult<T extends { id: string; timestamp: Date }>(rows: T[], limit: number, attributeCandidateMode = false) {
+function pageResult<T extends { id: string; timestamp: Date }>(
+  rows: T[],
+  limit: number,
+  attributeCandidateMode = false,
+  filterContext?: CursorFilterContext,
+) {
   const hasNextPage = rows.length > limit;
   const resultLogs = hasNextPage ? rows.slice(0, limit) : rows;
   const lastLog = resultLogs[resultLogs.length - 1];
   return {
     logs: resultLogs,
     nextCursor: hasNextPage && lastLog
-      ? encodeCursor({ ...lastLog, ...(attributeCandidateMode ? { attributeCandidateMode: true as const } : {}) })
+      ? encodeCursor({
+        ...lastLog,
+        ...(attributeCandidateMode ? { attributeCandidateMode: true as const } : {}),
+        ...(filterContext ? { filterContext } : {}),
+        limit,
+      })
       : null,
   };
+}
+
+function filterContextFromParams(params: LogQuery): CursorFilterContext | undefined {
+  const context: CursorFilterContext = {
+    ...(params.level ? { level: params.level } : {}),
+    ...(params.service ? { service: params.service } : {}),
+    ...(params.since ? { since: params.since.toISOString() } : {}),
+    ...(params.until ? { until: params.until.toISOString() } : {}),
+    ...(params.q !== undefined ? { q: params.q } : {}),
+    ...(Object.keys(params.attributes).length > 0 ? { attributes: { ...params.attributes } } : {}),
+  };
+  return Object.keys(context).length > 0 ? context : undefined;
 }
 
 type MaterializedPublicLog = {
@@ -346,6 +368,7 @@ async function attributeFiltersLookSparse(
 }
 
 export async function getLogs(params: LogQuery, tenantId = "default") {
+  const filterContext = filterContextFromParams(params);
   const nonAttributeConditions = nonAttributeFilterConditions(params);
   const baseConditions = filterConditions(params);
   baseConditions.push(eq(logs.tenantId, tenantId));
@@ -375,19 +398,19 @@ export async function getLogs(params: LogQuery, tenantId = "default") {
           .where(conditions.length > 0 ? and(...conditions) : undefined)
           .orderBy(desc(logs.timestamp), desc(logs.id))
           .limit(params.limit + 1);
-        return pageResult(rows, params.limit);
+        return pageResult(rows, params.limit, false, filterContext);
       }
       if (candidateCount === 0) return { logs: [], nextCursor: null };
     }
     const rows = await getMaterializedAttributePage(conditions, params.limit);
-    return pageResult(rows, params.limit, true);
+    return pageResult(rows, params.limit, true, filterContext);
   }
 
   const rows = await db.select(publicLogProjection()).from(logs)
     .where(conditions.length > 0 ? and(...conditions) : undefined)
     .orderBy(desc(logs.timestamp), desc(logs.id))
     .limit(params.limit + 1);
-  return pageResult(rows, params.limit);
+  return pageResult(rows, params.limit, false, filterContext);
 }
 
 type AggregateRow = { start: string; group: string | null; count: number };
