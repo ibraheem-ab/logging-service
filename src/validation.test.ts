@@ -13,6 +13,38 @@ test("accepts valid logs and reports invalid entries independently", () => {
   assert.deepEqual(result.rejected, [{ index: 1, reason: "invalid level: 'critical'" }]);
 });
 
+test("preserves arbitrary safe attribute keys and rejects values PostgreSQL cannot store", () => {
+  const accepted = validateIngestionBatch(JSON.parse(`{"logs":[{
+    "timestamp":"2020-08-09T10:00:00Z","level":"info","service":"api","message":"started",
+    "attributes":{"__proto__":"kept","ordinary":"value"}
+  }]}`));
+  assert.equal(accepted.validLogs.length, 1);
+  const acceptedLog = accepted.validLogs[0];
+  assert.ok(acceptedLog);
+  assert.ok(acceptedLog.attributes);
+  assert.equal(Object.prototype.hasOwnProperty.call(acceptedLog.attributes, "__proto__"), true);
+  assert.equal(acceptedLog.attributes.__proto__, "kept");
+
+  const directFilter = parseLogsQuery({ "attr.__proto__": "kept" });
+  const compoundFilter = parseLogsQuery({ query: "attr.__proto__:kept" });
+  assert.equal(Object.prototype.hasOwnProperty.call(directFilter.attributes, "__proto__"), true);
+  assert.equal(Object.prototype.hasOwnProperty.call(compoundFilter.attributes, "__proto__"), true);
+  assert.equal(compoundFilter.attributes.__proto__, "kept");
+
+  const rejected = validateIngestionBatch({ logs: [{
+    timestamp: "2020-08-09T10:00:00Z", level: "info", service: "api\0", message: "started",
+  }, {
+    timestamp: "2020-08-09T10:00:00Z", level: "info", service: "api", message: "started",
+    attributes: { region: "eu\0" },
+  }, {
+    timestamp: "2020-08-09T10:00:00Z", level: "info", service: "api", message: "started",
+    attributes: { "": "unqueryable" },
+  }] });
+  assert.equal(rejected.validLogs.length, 0);
+  assert.equal(rejected.rejected.length, 3);
+  assert.throws(() => parseLogsQuery({ "attr.__proto__": "kept\0" }), ApiError);
+});
+
 test("cursor round trip preserves deterministic ordering fields", () => {
   const cursor = { timestamp: new Date("2026-08-09T10:00:00.000Z"), id: "00000000-0000-4000-8000-000000000001" };
   assert.deepEqual(decodeCursor(encodeCursor(cursor)), cursor);
@@ -32,6 +64,23 @@ test("cursor preserves the internal selective-attribute pagination marker", () =
   assert.deepEqual(decodeCursor(encodeCursor(cursor)), cursor);
   const malformed = Buffer.from(JSON.stringify({
     timestamp: cursor.timestamp.toISOString(), id: cursor.id, attribute_candidate_mode: false,
+  })).toString("base64url");
+  assert.throws(() => decodeCursor(malformed), ApiError);
+});
+
+test("cursor preserves bounded attribute-page session state", () => {
+  const cursor = {
+    timestamp: new Date("2026-08-09T10:00:00.000Z"),
+    id: "0198f7c0-8a00-7a12-8abc-0123456789ab",
+    attributePageSession: {
+      id: "00000000-0000-4000-8000-000000000001",
+      offset: 100,
+    },
+  };
+  assert.deepEqual(decodeCursor(encodeCursor(cursor)), cursor);
+  const malformed = Buffer.from(JSON.stringify({
+    timestamp: cursor.timestamp.toISOString(), id: cursor.id,
+    attribute_page_session: { id: cursor.attributePageSession.id, offset: -1 },
   })).toString("base64url");
   assert.throws(() => decodeCursor(malformed), ApiError);
 });

@@ -48,7 +48,7 @@ async function main() {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ logs: [
-      { timestamp, level: "info", service, message: "first", attributes: { region: "eu-west", user_id: "42" } },
+      { timestamp, level: "info", service, message: "first literal 100%", attributes: { region: "eu-west", user_id: "42" } },
       { timestamp, level: "error", service, message: "second", attributes: { region: "eu-west", user_id: "42" } },
       { timestamp: newestMatchingTimestamp, level: "error", service, message: "cursor-match newest", attributes: { cursor_case: "match" } },
       { timestamp: distractorTimestamp, level: "error", service, message: "cursor-match distractor", attributes: { cursor_case: "distractor" } },
@@ -86,6 +86,11 @@ async function main() {
   assert(secondPage.status === 200, `GET /logs page 2 returned ${secondPage.status}`);
   const second = await secondPage.json() as LogPage;
   assert(second.logs.length === 1 && isMatchingLog(second.logs[0]) && second.logs[0].id !== first.logs[0].id && second.next_cursor === null, "cursor-only page 2 did not retain the original query");
+
+  const literalPercent = await request(`/logs?service=${encodeURIComponent(service)}&q=${encodeURIComponent("%")}&limit=10`);
+  assert(literalPercent.status === 200, `literal q GET /logs returned ${literalPercent.status}`);
+  const literalPercentPage = await literalPercent.json() as LogPage;
+  assert(literalPercentPage.logs.length === 1 && literalPercentPage.logs[0]?.message === "first literal 100%", "q must treat SQL wildcard characters literally");
 
   const aggregate = await request(`/logs/aggregate?service=${encodeURIComponent(service)}&attr.user_id=42&since=${encodeURIComponent(aggregateSince)}&until=${encodeURIComponent(aggregateUntil)}&bucket=5m&group_by=service`);
   assert(aggregate.status === 200, `GET /logs/aggregate returned ${aggregate.status}`);

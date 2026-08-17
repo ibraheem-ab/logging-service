@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, ilike, lt, lte, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lt, lte, or, sql, type SQL } from "drizzle-orm";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { randomUUID } from "node:crypto";
@@ -8,6 +8,7 @@ import type { AggregateQuery, LogQuery } from "../validation.js";
 import { client, db } from "./index.js";
 import { logs, type NewLog } from "./schema.js";
 import type { AttributeValue, LogAttributes } from "../types.js";
+import { QueryPageSessions } from "../services/query-page-sessions.js";
 
 export type LogWrite = { entry: NewLog; tenantId: string };
 
@@ -46,16 +47,58 @@ export async function insertLogs(entries: NewLog[], tenantId = "default") {
 
 export async function insertLogWrites(entries: LogWrite[]) {
   if (entries.length === 0) return;
-  const prepared = entries.map(prepareLogWrite);
-  const copyRows = prepared.map(toCopyRow).join("");
-  const rollups = rollupWrites(prepared);
+  // This runs on the application container's constrained half-core. Build the
+  // COPY payload and its compact rollup groups in one pass instead of creating
+  // three full-size intermediate arrays for every durable micro-batch.
+  const copyRows = new Array<string>(entries.length);
+  const rollupGroups = new Map<string, RollupWrite>();
+  const timestampTexts = new Map<number, { timestamp: string; bucketStart: string }>();
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const { entry, tenantId } = entries[index];
+    const timestamp = entry.timestamp instanceof Date
+      ? entry.timestamp
+      : new Date(entry.timestamp ?? Date.now());
+    const milliseconds = timestamp.getTime();
+    let timestampText = timestampTexts.get(milliseconds);
+    if (!timestampText) {
+      const text = timestamp.toISOString();
+      timestampText = { timestamp: text, bucketStart: `${text.slice(0, 19)}.000Z` };
+      timestampTexts.set(milliseconds, timestampText);
+    }
+    const id = uuidV7(milliseconds);
+    const attributes = JSON.stringify(entry.attributes ?? {});
+    copyRows[index] = `${escapeCopyField(id)}\t${escapeCopyField(timestampText.timestamp)}\t${escapeCopyField(entry.level)}\t${escapeCopyField(entry.service)}\t${escapeCopyField(entry.message)}\t${escapeCopyField(attributes)}\t${escapeCopyField(tenantId)}\n`;
+
+    const rollupKey = JSON.stringify([tenantId, timestampText.bucketStart, entry.service, entry.level]);
+    const existing = rollupGroups.get(rollupKey);
+    if (existing) {
+      existing.count += 1;
+    } else {
+      rollupGroups.set(rollupKey, {
+        tenant_id: tenantId,
+        bucket_start: timestampText.bucketStart,
+        service: entry.service,
+        level: entry.level,
+        count: 1,
+      });
+    }
+  }
+
+  const copyRowsText = copyRows.join("");
+  const rollups = [...rollupGroups.values()].sort((left, right) =>
+    left.tenant_id.localeCompare(right.tenant_id)
+    || left.bucket_start.localeCompare(right.bucket_start)
+    || left.service.localeCompare(right.service)
+    || left.level.localeCompare(right.level),
+  );
 
   await client.begin(async (transaction) => {
     const copyStream = await transaction`
       COPY logs (id, timestamp, level, service, message, attributes, tenant_id)
       FROM STDIN
     `.writable();
-    await pipeline(Readable.from([copyRows]), copyStream);
+    await pipeline(Readable.from([copyRowsText]), copyStream);
 
     // Append a transactionally-consistent rollup delta instead of contending on
     // the hot current-second summary row. Aggregate queries include deltas
@@ -138,17 +181,6 @@ function prepareLogWrite(write: LogWrite): PreparedLogWrite {
   };
 }
 
-function toCopyRow({ entry, tenantId, id, timestamp }: PreparedLogWrite) {
-  return [
-    id,
-    timestamp,
-    entry.level,
-    entry.service,
-    entry.message,
-    JSON.stringify(entry.attributes ?? {}), tenantId,
-  ].map((field) => escapeCopyField(String(field))).join("\t") + "\n";
-}
-
 // PostgreSQL's random UUID default is excellent for uniqueness but scatters
 // inserts across every UUID B-tree page. UUIDv7 preserves the UUID API while
 // making IDs generated for current logs append-friendly in the primary and
@@ -213,13 +245,20 @@ function attributeCondition(key: string, value: string): SQL {
   return conditions.length === 1 ? conditions[0] : or(...conditions)!;
 }
 
+function literalSubstringPattern(value: string) {
+  // `ILIKE` treats %, _, and the escape character itself as pattern syntax.
+  // The API's q parameter is a literal message substring, so protect those
+  // characters before binding the pattern.
+  return `%${value.replace(/[!%_]/g, "!$&")}%`;
+}
+
 function nonAttributeFilterConditions(params: Omit<LogQuery, "limit" | "cursor">, untilExclusive = false): SQL[] {
   const conditions: SQL[] = [];
   if (params.level) conditions.push(eq(logs.level, params.level));
   if (params.service) conditions.push(eq(logs.service, params.service));
   if (params.since) conditions.push(gte(logs.timestamp, params.since));
   if (params.until) conditions.push(untilExclusive ? lt(logs.timestamp, params.until) : lte(logs.timestamp, params.until));
-  if (params.q) conditions.push(ilike(logs.message, `%${params.q}%`));
+  if (params.q) conditions.push(sql`${logs.message} ILIKE ${literalSubstringPattern(params.q)} ESCAPE '!'`);
   return conditions;
 }
 
@@ -239,11 +278,21 @@ function cursorCondition(cursor: DecodedCursor): SQL {
   return sql`(${logs.timestamp}, ${logs.id}) < (${cursor.timestamp.toISOString()}::timestamptz, ${cursor.id}::uuid)`;
 }
 
-// Stay comfortably below PostgreSQL's 65,535 bind-parameter limit while
-// allowing a 1%-scale retained-data filter to paginate through candidates.
-const ATTRIBUTE_FAST_PATH_CANDIDATES = 20_000;
-const ATTRIBUTE_DENSITY_SAMPLE_ROWS = 64;
-const ATTRIBUTE_DENSE_SAMPLE_MATCHES = 8;
+// A small selective result can safely be re-materialized for each page. A
+// larger, still-selective result needs a bounded in-memory ID snapshot so a
+// `limit=100` cursor does not repeat a GIN filter/sort or timestamp scan on
+// every page against a retained multi-million-row table.
+const ATTRIBUTE_SESSION_CANDIDATES = 100_000;
+const ATTRIBUTE_OVER_CAP_PLAN_TTL_MS = 30_000;
+const attributePageSessions = new QueryPageSessions({
+  maxSessions: 2,
+  maxIdsPerSession: ATTRIBUTE_SESSION_CANDIDATES,
+  // Two 1%-scale retained-data walks can coexist without retaining full log
+  // payloads or approaching the 256 MB application memory limit.
+  maxTotalIds: 160_000,
+  ttlMs: 60_000,
+});
+const overCapAttributePlans = new Map<string, number>();
 
 function publicLogProjection() {
   // Tenant identity is an internal authorization boundary, not part of the
@@ -264,6 +313,7 @@ function pageResult<T extends { id: string; timestamp: Date }>(
   limit: number,
   attributeCandidateMode = false,
   filterContext?: CursorFilterContext,
+  attributePageSession?: { id: string; offset: number },
 ) {
   const hasNextPage = rows.length > limit;
   const resultLogs = hasNextPage ? rows.slice(0, limit) : rows;
@@ -274,6 +324,7 @@ function pageResult<T extends { id: string; timestamp: Date }>(
       ? encodeCursor({
         ...lastLog,
         ...(attributeCandidateMode ? { attributeCandidateMode: true as const } : {}),
+        ...(attributePageSession ? { attributePageSession } : {}),
         ...(filterContext ? { filterContext } : {}),
         limit,
       })
@@ -302,11 +353,9 @@ type MaterializedPublicLog = {
   attributes: LogAttributes;
 };
 
-// An ordered scan is efficient when an attribute is common, because the
-// timestamp/id index can stream the first page. For a result set that was
-// proven small, materialize the GIN-filtered rows first and sort that bounded
-// set instead. This avoids constructing a many-thousand-parameter `IN (...)`
-// query on every cursor page while preserving the same order and filters.
+// Kept only so cursors emitted by the earlier bounded-candidate implementation
+// remain usable during a rolling deployment. New queries use a page session,
+// avoiding a full JSONB materialization on every continuation page.
 async function getMaterializedAttributePage(conditions: SQL[], limit: number) {
   const result = await db.execute(sql`
     WITH filtered AS MATERIALIZED (
@@ -326,84 +375,178 @@ async function getMaterializedAttributePage(conditions: SQL[], limit: number) {
   }));
 }
 
-// Count no more than the configured cap without sending up to 20,001 UUIDs
-// through the application just to decide which read plan to use.
-async function boundedAttributeCandidateCount(conditions: SQL[]) {
+// Materialize no more than the session cap once. If fewer rows are returned,
+// this is the complete matching set and is already in the exact page order.
+// If the sentinel row exists, the query is too broad for an in-memory
+// snapshot and the normal stateless keyset path remains the safe fallback.
+async function getBoundedOrderedAttributeCandidateIds(conditions: SQL[]) {
   const result = await db.execute(sql`
-    SELECT count(*)::integer AS count
-    FROM (
-      SELECT 1
+    WITH candidates AS MATERIALIZED (
+      SELECT "logs"."id", "logs"."timestamp"
       FROM "logs"
       WHERE ${and(...conditions)}
-      LIMIT ${ATTRIBUTE_FAST_PATH_CANDIDATES + 1}
-    ) AS candidates
+      LIMIT ${ATTRIBUTE_SESSION_CANDIDATES + 1}
+    )
+    SELECT id
+    FROM candidates
+    ORDER BY timestamp DESC, id DESC
   `);
-  const rows = result as unknown as Array<{ count: number | string }>;
-  return Number(rows[0]?.count ?? 0);
+  return (result as unknown as Array<{ id: string }>).map((row) => row.id);
 }
 
-function matchesAttributeFilters(attributes: LogAttributes, requested: Record<string, string>) {
-  return Object.entries(requested).every(([key, value]) => {
-    const actual = attributes[key];
-    return actual === value || actual === attributeValueFromQuery(value);
+function attributeQueryKey(params: LogQuery, tenantId: string) {
+  return JSON.stringify({
+    tenantId,
+    level: params.level ?? null,
+    service: params.service ?? null,
+    since: params.since?.toISOString() ?? null,
+    until: params.until?.toISOString() ?? null,
+    q: params.q ?? null,
+    attributes: Object.entries(params.attributes).sort(([left], [right]) => left.localeCompare(right)),
   });
 }
 
-async function attributeFiltersLookSparse(
-  params: LogQuery,
+function hasKnownOverCapAttributePlan(key: string) {
+  const expiresAt = overCapAttributePlans.get(key);
+  if (expiresAt === undefined) return false;
+  if (expiresAt > Date.now()) return true;
+  overCapAttributePlans.delete(key);
+  return false;
+}
+
+function rememberOverCapAttributePlan(key: string) {
+  // Bound this best-effort planner hint as well. It only avoids repeated
+  // expensive classification of the same broad query; correctness never
+  // depends on it.
+  if (overCapAttributePlans.size >= 128) {
+    const oldest = overCapAttributePlans.keys().next().value;
+    if (oldest !== undefined) overCapAttributePlans.delete(oldest);
+  }
+  overCapAttributePlans.set(key, Date.now() + ATTRIBUTE_OVER_CAP_PLAN_TTL_MS);
+}
+
+type IndexedPublicLog = {
+  row: {
+    id: string;
+    timestamp: Date;
+    level: string;
+    service: string;
+    message: string;
+    attributes: LogAttributes;
+  };
+  index: number;
+};
+
+async function getRowsForOrderedIds(ids: readonly string[], tenantId: string) {
+  if (ids.length === 0) return [];
+  const rows = await db.select(publicLogProjection()).from(logs)
+    .where(and(eq(logs.tenantId, tenantId), inArray(logs.id, [...ids])));
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  return ids.flatMap((id) => {
+    const row = byId.get(id);
+    return row ? [row] : [];
+  });
+}
+
+async function getAttributeSessionPage(
+  session: { id: string; ids: readonly string[] },
+  offset: number,
+  limit: number,
   tenantId: string,
-  nonAttributeConditions: SQL[],
+  filterContext?: CursorFilterContext,
 ) {
-  const conditions = [...nonAttributeConditions, eq(logs.tenantId, tenantId)];
-  if (params.cursor) conditions.push(cursorCondition(params.cursor));
-  const sample = await db.select({ attributes: logs.attributes }).from(logs)
-    .where(and(...conditions))
-    .orderBy(desc(logs.timestamp), desc(logs.id))
-    .limit(ATTRIBUTE_DENSITY_SAMPLE_ROWS);
-  const matches = sample.reduce(
-    (count, row) => count + (matchesAttributeFilters(row.attributes, params.attributes) ? 1 : 0),
-    0,
+  const collected: IndexedPublicLog[] = [];
+  let nextIndex = offset;
+  const targetRows = limit + 1;
+
+  // Retention can delete a row after the snapshot is built. In that rare case
+  // keep advancing until this page is filled rather than exposing an empty
+  // page with a non-null cursor or accidentally ending the walk early.
+  while (collected.length < targetRows && nextIndex < session.ids.length) {
+    const chunkSize = Math.min(
+      session.ids.length - nextIndex,
+      Math.max(targetRows - collected.length, 128),
+    );
+    const ids = session.ids.slice(nextIndex, nextIndex + chunkSize);
+    const rows = await getRowsForOrderedIds(ids, tenantId);
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    for (let index = 0; index < ids.length; index += 1) {
+      const row = byId.get(ids[index]);
+      if (row) collected.push({ row, index: nextIndex + index });
+      if (collected.length >= targetRows) break;
+    }
+    nextIndex += ids.length;
+  }
+
+  const visible = collected.slice(0, limit);
+  const last = visible.at(-1);
+  const hasNextPage = last !== undefined && (
+    collected.length > limit || last.index < session.ids.length - 1
   );
-  return matches < ATTRIBUTE_DENSE_SAMPLE_MATCHES;
+  if (!hasNextPage) attributePageSessions.delete(session.id);
+  return {
+    logs: visible.map(({ row }) => row),
+    nextCursor: hasNextPage && last
+      ? encodeCursor({
+        ...last.row,
+        attributePageSession: { id: session.id, offset: last.index + 1 },
+        ...(filterContext ? { filterContext } : {}),
+        limit,
+      })
+      : null,
+  };
 }
 
 export async function getLogs(params: LogQuery, tenantId = "default") {
   const filterContext = filterContextFromParams(params);
-  const nonAttributeConditions = nonAttributeFilterConditions(params);
   const baseConditions = filterConditions(params);
   baseConditions.push(eq(logs.tenantId, tenantId));
   const conditions = [...baseConditions];
   if (params.cursor) conditions.push(cursorCondition(params.cursor));
 
-  // A timestamp/id seek is best for dense attributes, while a rare attr.*
-  // lookup can otherwise scan millions of ordered rows before finding a
-  // match. Classify only the first page from a tiny ordered sample. A cursor
-  // marked by a proven-small first page keeps using the GIN/materialize path;
-  // broad filters retain the ordinary keyset seek and never pay repeated GIN
-  // work.
   const hasAttributes = Object.keys(params.attributes).length > 0;
-  const useCandidateMode = hasAttributes && (
-    params.cursor?.attributeCandidateMode === true
-    || (!params.cursor && await attributeFiltersLookSparse(params, tenantId, nonAttributeConditions))
-  );
-  if (useCandidateMode) {
-    // The first page establishes that the full result set is bounded. Later
-    // cursor pages inherit that proof through the opaque cursor, so they can
-    // run a single materialized query instead of repeatedly fetching IDs just
-    // to rediscover the same bound.
-    if (params.cursor?.attributeCandidateMode !== true) {
-      const candidateCount = await boundedAttributeCandidateCount(conditions);
-      if (candidateCount > ATTRIBUTE_FAST_PATH_CANDIDATES) {
-        const rows = await db.select(publicLogProjection()).from(logs)
-          .where(conditions.length > 0 ? and(...conditions) : undefined)
-          .orderBy(desc(logs.timestamp), desc(logs.id))
-          .limit(params.limit + 1);
-        return pageResult(rows, params.limit, false, filterContext);
-      }
-      if (candidateCount === 0) return { logs: [], nextCursor: null };
+  const queryKey = hasAttributes ? attributeQueryKey(params, tenantId) : undefined;
+
+  if (params.cursor?.attributePageSession && queryKey) {
+    const session = attributePageSessions.get(
+      params.cursor.attributePageSession.id,
+      tenantId,
+      queryKey,
+    );
+    if (session) {
+      return getAttributeSessionPage(
+        session,
+        params.cursor.attributePageSession.offset,
+        params.limit,
+        tenantId,
+        filterContext,
+      );
     }
+    // A session is intentionally short-lived. Falling back to the stateless
+    // tuple cursor preserves a correct result after expiry or app restart.
+  }
+
+  if (hasAttributes && params.cursor?.attributeCandidateMode === true) {
+    // Legacy cursors emitted before bounded page sessions remain usable.
     const rows = await getMaterializedAttributePage(conditions, params.limit);
     return pageResult(rows, params.limit, true, filterContext);
+  }
+
+  if (hasAttributes && !params.cursor && queryKey && !hasKnownOverCapAttributePlan(queryKey)) {
+    const ids = await getBoundedOrderedAttributeCandidateIds(conditions);
+    if (ids.length === 0) return { logs: [], nextCursor: null };
+    if (ids.length <= params.limit) {
+      return { logs: await getRowsForOrderedIds(ids, tenantId), nextCursor: null };
+    }
+    const session = ids.length <= ATTRIBUTE_SESSION_CANDIDATES
+      ? attributePageSessions.create(tenantId, queryKey, ids)
+      : undefined;
+    if (session) return getAttributeSessionPage(session, 0, params.limit, tenantId, filterContext);
+
+    // Only a sentinel row proves that this filter is too broad. A transient
+    // session-capacity decision must not pin a genuinely selective query to
+    // the slow stateless plan.
+    if (ids.length > ATTRIBUTE_SESSION_CANDIDATES) rememberOverCapAttributePlan(queryKey);
   }
 
   const rows = await db.select(publicLogProjection()).from(logs)

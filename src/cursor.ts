@@ -2,6 +2,7 @@ import { ApiError } from "./errors.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_CURSOR_LIMIT = 10_000;
+const MAX_ATTRIBUTE_SESSION_OFFSET = 100_000;
 
 export type CursorFilterContext = {
   level?: string;
@@ -19,6 +20,7 @@ export type DecodedCursor = {
   timestamp: Date;
   id: string;
   attributeCandidateMode?: true;
+  attributePageSession?: { id: string; offset: number };
   filterContext?: CursorFilterContext;
   limit?: number;
 };
@@ -28,6 +30,12 @@ export function encodeCursor(cursor: DecodedCursor) {
     timestamp: cursor.timestamp.toISOString(),
     id: cursor.id,
     ...(cursor.attributeCandidateMode ? { attribute_candidate_mode: true } : {}),
+    ...(cursor.attributePageSession ? {
+      attribute_page_session: {
+        id: cursor.attributePageSession.id,
+        offset: cursor.attributePageSession.offset,
+      },
+    } : {}),
     ...(cursor.filterContext ? { filter_context: cursor.filterContext } : {}),
     ...(cursor.limit ? { limit: cursor.limit } : {}),
   })).toString("base64url");
@@ -73,6 +81,23 @@ export function decodeCursor(value: string): DecodedCursor {
     if (attributeCandidateMode !== undefined && attributeCandidateMode !== true) {
       throw new ApiError("invalid cursor");
     }
+    let attributePageSession: { id: string; offset: number } | undefined;
+    if ("attribute_page_session" in parsed) {
+      const rawSession = parsed.attribute_page_session;
+      if (
+        !isPlainObject(rawSession)
+        || typeof rawSession.id !== "string"
+        || !UUID_PATTERN.test(rawSession.id)
+        || typeof rawSession.offset !== "number"
+        || !Number.isInteger(rawSession.offset)
+        || rawSession.offset < 0
+        || rawSession.offset > MAX_ATTRIBUTE_SESSION_OFFSET
+      ) {
+        throw new ApiError("invalid cursor");
+      }
+      attributePageSession = { id: rawSession.id, offset: rawSession.offset };
+    }
+    if (attributeCandidateMode === true && attributePageSession) throw new ApiError("invalid cursor");
     const filterContext = decodeFilterContext("filter_context" in parsed ? parsed.filter_context : undefined);
     let limit: number | undefined;
     if ("limit" in parsed) {
@@ -86,6 +111,7 @@ export function decodeCursor(value: string): DecodedCursor {
       timestamp,
       id: parsed.id,
       ...(attributeCandidateMode === true ? { attributeCandidateMode: true as const } : {}),
+      ...(attributePageSession ? { attributePageSession } : {}),
       ...(filterContext ? { filterContext } : {}),
       ...(limit !== undefined ? { limit } : {}),
     };

@@ -62,28 +62,50 @@ function parseTimestamp(value: unknown, field: string, requireIsoFormat: boolean
 
 function validateAttributes(value: unknown): LogAttributes {
   if (!isPlainObject(value)) throw new ApiError("attributes must be a flat object");
+  // Define keys rather than assigning them so valid JSON keys such as
+  // "__proto__" remain own properties instead of invoking a legacy setter.
   const attributes: LogAttributes = {};
   for (const [key, attributeValue] of Object.entries(value)) {
-    if (!key || typeof attributeValue === "object" || typeof attributeValue === "undefined" || !["string", "number", "boolean"].includes(typeof attributeValue)) {
+    // Attribute keys are otherwise intentionally unconstrained by the core
+    // ingestion contract. Empty keys cannot be addressed through `attr.*`,
+    // and NUL cannot be stored by PostgreSQL in JSONB.
+    if (!key) throw new ApiError("attribute keys must not be empty");
+    if (key.includes("\0")) throw new ApiError("attribute keys must not contain NUL characters");
+    if (typeof attributeValue === "object" || typeof attributeValue === "undefined" || !["string", "number", "boolean"].includes(typeof attributeValue)) {
       throw new ApiError("attributes values must be strings, numbers, or booleans");
     }
     if (typeof attributeValue === "number" && !Number.isFinite(attributeValue)) {
       throw new ApiError("attributes values must be finite numbers");
     }
-    attributes[key] = attributeValue as string | number | boolean;
+    if (typeof attributeValue === "string" && attributeValue.includes("\0")) {
+      throw new ApiError("attributes values must not contain NUL characters");
+    }
+    Object.defineProperty(attributes, key, {
+      value: attributeValue as string | number | boolean,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
   }
   return attributes;
 }
 
-function validateLog(value: unknown): NewLog {
+function validateLog(value: unknown, timestamps?: Map<string, Date>): NewLog {
   if (!isPlainObject(value)) throw new ApiError("log entry must be an object");
-  const timestamp = parseTimestamp(value.timestamp, "timestamp", true);
+  const rawTimestamp = value.timestamp;
+  let timestamp = typeof rawTimestamp === "string" ? timestamps?.get(rawTimestamp) : undefined;
+  if (!timestamp) {
+    timestamp = parseTimestamp(rawTimestamp, "timestamp", true);
+    if (typeof rawTimestamp === "string") timestamps?.set(rawTimestamp, timestamp);
+  }
   if (timestamp.getTime() > Date.now() + 5 * 60 * 1000) throw new ApiError("timestamp must not be more than five minutes in the future");
   if (typeof value.level !== "string" || !logLevels.includes(value.level as LogLevel)) {
     throw new ApiError(`invalid level: '${String(value.level)}'`);
   }
   if (typeof value.service !== "string" || value.service.trim() === "") throw new ApiError("service must be a non-empty string");
+  if (value.service.includes("\0")) throw new ApiError("service must not contain NUL characters");
   if (typeof value.message !== "string" || value.message.trim() === "") throw new ApiError("message must be a non-empty string");
+  if (value.message.includes("\0")) throw new ApiError("message must not contain NUL characters");
   return {
     timestamp,
     level: value.level as LogLevel,
@@ -97,9 +119,13 @@ export function validateIngestionBatch(body: unknown) {
   if (!isPlainObject(body) || !Array.isArray(body.logs)) throw new ApiError("request body must be an object with a logs array");
   const validLogs: NewLog[] = [];
   const rejected: Array<{ index: number; reason: string }> = [];
+  // Load generators normally stamp every entry in a small HTTP batch with the
+  // same instant. Parsing that identical ISO value once avoids needless regex
+  // and Date work without changing per-entry validation semantics.
+  const timestamps = new Map<string, Date>();
   body.logs.forEach((entry, index) => {
     try {
-      validLogs.push(validateLog(entry));
+      validLogs.push(validateLog(entry, timestamps));
     } catch (error) {
       rejected.push({ index, reason: error instanceof Error ? error.message : "invalid log entry" });
     }
@@ -111,11 +137,13 @@ function scalar(query: Record<string, unknown>, name: string): string | undefine
   const value = query[name];
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new ApiError(`${name} must be a single string`);
+  if (value.includes("\0")) throw new ApiError(`${name} must not contain NUL characters`);
   return value;
 }
 
 function validateAttributeKey(key: string) {
-  if (!key || key.length > 128) throw new ApiError("attribute filter key must be between 1 and 128 characters");
+  if (!key) throw new ApiError("attribute filter key must not be empty");
+  if (key.includes("\0")) throw new ApiError("attribute filter key must not contain NUL characters");
 }
 
 function parseFilters(query: Record<string, unknown>, aggregation = false) {
@@ -128,7 +156,13 @@ function parseFilters(query: Record<string, unknown>, aggregation = false) {
       const attributeKey = key.slice(5);
       validateAttributeKey(attributeKey);
       if (typeof value !== "string") throw new ApiError(`${key} must be a single string`);
-      attributes[attributeKey] = value;
+      if (value.includes("\0")) throw new ApiError(`${key} must not contain NUL characters`);
+      Object.defineProperty(attributes, attributeKey, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
     } else if (!allowed.has(key)) {
       throw new ApiError(`unsupported query parameter: ${key}`);
     }
@@ -155,7 +189,19 @@ function parseFilters(query: Record<string, unknown>, aggregation = false) {
       if (key === "service") service = value;
       else if (key === "level") level = value;
       else if (key === "q") q = value;
-      else if (key.startsWith("attr.")) { validateAttributeKey(key.slice(5)); attributes[key.slice(5)] = value; }
+      else if (key.startsWith("attr.")) {
+        const attributeKey = key.slice(5);
+        validateAttributeKey(attributeKey);
+        // Keep compound-query attributes consistent with direct `attr.*`
+        // parameters. In particular, assigning `__proto__` to a normal
+        // object invokes a legacy setter instead of creating a filter.
+        Object.defineProperty(attributes, attributeKey, {
+          value,
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      }
       else throw new ApiError(`unsupported query term: ${key}`);
     }
   }
