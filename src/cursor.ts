@@ -2,7 +2,10 @@ import { ApiError } from "./errors.js";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_CURSOR_LIMIT = 10_000;
-const MAX_ATTRIBUTE_SESSION_OFFSET = 100_000;
+// A broad attribute drain can retain a compact, in-memory UUID snapshot.
+// Keep the cursor bound aligned with that deliberately finite memory budget so
+// a fabricated opaque cursor cannot express an unbounded application offset.
+const MAX_ATTRIBUTE_SESSION_OFFSET = 2_000_000;
 
 export type CursorFilterContext = {
   level?: string;
@@ -13,14 +16,15 @@ export type CursorFilterContext = {
   attributes?: Record<string, string>;
 };
 
-// This is deliberately an implementation detail inside the opaque cursor. It
-// records that the first page proved an attribute result set was small enough
-// to use the bounded candidate strategy on subsequent pages.
+// This legacy implementation detail is still parsed so cursors issued by an
+// older deployment remain structurally valid. New query paths ignore it and
+// safely use ordinary keyset pagination when no page session is available.
 export type DecodedCursor = {
   timestamp: Date;
   id: string;
   attributeCandidateMode?: true;
   attributePageSession?: { id: string; offset: number };
+  attributeProbeSession?: { id: string; offset: number };
   filterContext?: CursorFilterContext;
   limit?: number;
 };
@@ -34,6 +38,12 @@ export function encodeCursor(cursor: DecodedCursor) {
       attribute_page_session: {
         id: cursor.attributePageSession.id,
         offset: cursor.attributePageSession.offset,
+      },
+    } : {}),
+    ...(cursor.attributeProbeSession ? {
+      attribute_probe_session: {
+        id: cursor.attributeProbeSession.id,
+        offset: cursor.attributeProbeSession.offset,
       },
     } : {}),
     ...(cursor.filterContext ? { filter_context: cursor.filterContext } : {}),
@@ -97,7 +107,28 @@ export function decodeCursor(value: string): DecodedCursor {
       }
       attributePageSession = { id: rawSession.id, offset: rawSession.offset };
     }
-    if (attributeCandidateMode === true && attributePageSession) throw new ApiError("invalid cursor");
+    let attributeProbeSession: { id: string; offset: number } | undefined;
+    if ("attribute_probe_session" in parsed) {
+      const rawSession = parsed.attribute_probe_session;
+      if (
+        !isPlainObject(rawSession)
+        || typeof rawSession.id !== "string"
+        || !UUID_PATTERN.test(rawSession.id)
+        || typeof rawSession.offset !== "number"
+        || !Number.isInteger(rawSession.offset)
+        || rawSession.offset < 0
+        || rawSession.offset > MAX_ATTRIBUTE_SESSION_OFFSET
+      ) {
+        throw new ApiError("invalid cursor");
+      }
+      attributeProbeSession = { id: rawSession.id, offset: rawSession.offset };
+    }
+    if (
+      (attributeCandidateMode === true && (attributePageSession || attributeProbeSession))
+      || (attributePageSession && attributeProbeSession)
+    ) {
+      throw new ApiError("invalid cursor");
+    }
     const filterContext = decodeFilterContext("filter_context" in parsed ? parsed.filter_context : undefined);
     let limit: number | undefined;
     if ("limit" in parsed) {
@@ -112,6 +143,7 @@ export function decodeCursor(value: string): DecodedCursor {
       id: parsed.id,
       ...(attributeCandidateMode === true ? { attributeCandidateMode: true as const } : {}),
       ...(attributePageSession ? { attributePageSession } : {}),
+      ...(attributeProbeSession ? { attributeProbeSession } : {}),
       ...(filterContext ? { filterContext } : {}),
       ...(limit !== undefined ? { limit } : {}),
     };

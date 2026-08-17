@@ -11,43 +11,50 @@ import { notifyErrorThreshold } from "./services/alerts.js";
 import { enqueueIngestion } from "./services/ingestion-batcher.js";
 
 export const app = express();
+const defaultPrincipal: Principal = { tenantId: "default", scopes: ["ingest", "query"], seeded: false };
 
 app.disable("x-powered-by");
 // Cursor pages are dynamic and can be large; calculating an ETag hashes every
 // response body without helping the load-generator contract.
 app.disable("etag");
-app.use((_req, res, next) => { res.on("finish", () => recordRequest(res.statusCode)); next(); });
-app.use((req, res, next) => {
-  if (!config.compressionEnabled || !req.acceptsEncodings("gzip")) return next();
-  const send = res.send.bind(res);
-  res.send = ((body: unknown) => {
-    if (res.get("content-encoding") || (typeof body !== "string" && !Buffer.isBuffer(body))) return send(body as never);
-    const source = Buffer.isBuffer(body) ? body : Buffer.from(body);
-    if (source.length < 1024) return send(body as never);
-    res.set("content-encoding", "gzip").removeHeader("content-length");
-    return send(gzipSync(source) as never);
-  }) as Response["send"];
-  return next();
-});
+if (config.metricsEnabled) {
+  app.use((_req, res, next) => { res.on("finish", () => recordRequest(res.statusCode)); next(); });
+}
+if (config.compressionEnabled) {
+  app.use((req, res, next) => {
+    if (!req.acceptsEncodings("gzip")) return next();
+    const send = res.send.bind(res);
+    res.send = ((body: unknown) => {
+      if (res.get("content-encoding") || (typeof body !== "string" && !Buffer.isBuffer(body))) return send(body as never);
+      const source = Buffer.isBuffer(body) ? body : Buffer.from(body);
+      if (source.length < 1024) return send(body as never);
+      res.set("content-encoding", "gzip").removeHeader("content-length");
+      return send(gzipSync(source) as never);
+    }) as Response["send"];
+    return next();
+  });
+}
 
 app.get("/health", (_req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.use(async (req, res, next) => {
-  if (!config.authEnabled || req.path === "/health") return next();
-  const authorization = req.get("authorization");
-  const bearer = authorization?.match(/^Bearer\s+(.+)$/i)?.[1] ?? req.get("x-api-key");
-  if (!bearer) return res.status(401).json({ error: "missing or malformed credential" });
-  try {
-    const principal = await authenticate(bearer);
-    if (!principal) return res.status(401).json({ error: "invalid credential" });
-    res.locals.principal = principal;
-    return next();
-  } catch (error) {
-    return next(error);
-  }
-});
+if (config.authEnabled) {
+  app.use(async (req, res, next) => {
+    if (req.path === "/health") return next();
+    const authorization = req.get("authorization");
+    const bearer = authorization?.match(/^Bearer\s+(.+)$/i)?.[1] ?? req.get("x-api-key");
+    if (!bearer) return res.status(401).json({ error: "missing or malformed credential" });
+    try {
+      const principal = await authenticate(bearer);
+      if (!principal) return res.status(401).json({ error: "invalid credential" });
+      res.locals.principal = principal;
+      return next();
+    } catch (error) {
+      return next(error);
+    }
+  });
+}
 
 app.get("/metrics", (_req, res) => {
   if (!config.metricsEnabled) return res.status(404).json({ error: "metrics disabled" });
@@ -59,33 +66,37 @@ app.get("/dashboard", (_req, res) => {
 });
 
 function principalFor(res: Response): Principal {
-  return res.locals.principal ?? { tenantId: "default", scopes: ["ingest", "query"], seeded: false };
+  return res.locals.principal ?? defaultPrincipal;
 }
 
-app.use((req, res, next) => {
-  if (!req.path.startsWith("/logs")) return next();
-  const principal = principalFor(res);
-  if (!allowRequest(principal.tenantId, config.rateLimitEnabled, config.rateLimitRequests, principal.seeded)) {
-    return res.set("retry-after", "60").status(429).json({ error: "rate limit exceeded" });
-  }
-  return next();
-});
+if (config.rateLimitEnabled) {
+  app.use((req, res, next) => {
+    if (!req.path.startsWith("/logs")) return next();
+    const principal = principalFor(res);
+    if (!allowRequest(principal.tenantId, true, config.rateLimitRequests, principal.seeded)) {
+      return res.set("retry-after", "60").status(429).json({ error: "rate limit exceeded" });
+    }
+    return next();
+  });
+}
 
-app.use((req, res, next) => {
-  if (req.method !== "POST" || req.path !== "/logs") return next();
-  if (!beginIngestion(config.backpressureEnabled, config.maxConcurrentIngestions)) {
-    return res.set("retry-after", "1").status(503).json({ error: "ingestion queue is full" });
-  }
-  let released = false;
-  const release = () => {
-    if (released) return;
-    released = true;
-    endIngestion();
-  };
-  res.once("finish", release);
-  res.once("close", release);
-  return next();
-});
+if (config.backpressureEnabled) {
+  app.use((req, res, next) => {
+    if (req.method !== "POST" || req.path !== "/logs") return next();
+    if (!beginIngestion(true, config.maxConcurrentIngestions)) {
+      return res.set("retry-after", "1").status(503).json({ error: "ingestion queue is full" });
+    }
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      endIngestion();
+    };
+    res.once("finish", release);
+    res.once("close", release);
+    return next();
+  });
+}
 
 app.use(express.json({ limit: config.maxBodySize }));
 
@@ -102,8 +113,8 @@ app.post("/logs", async (req, res, next) => {
     }
 
     await enqueueIngestion(principal.tenantId, result.validLogs);
-    notifyErrorThreshold(result.validLogs, principal.tenantId);
-    recordIngestion(result.validLogs.length, result.rejected.length);
+    if (config.alertsEnabled) notifyErrorThreshold(result.validLogs, principal.tenantId);
+    if (config.metricsEnabled) recordIngestion(result.validLogs.length, result.rejected.length);
     if (config.liveTailEnabled) publishTail(principal.tenantId, result.validLogs);
     return res.status(200).json({ accepted: result.validLogs.length, rejected: result.rejected });
   } catch (error) {

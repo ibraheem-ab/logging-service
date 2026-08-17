@@ -121,3 +121,27 @@ test("does not add a second batching delay after a busy writer releases", async 
   ]);
   await Promise.all([first, second]);
 });
+
+test("preserves FIFO order after compacting a large pending request backlog", async () => {
+  const written: string[] = [];
+  let firstStarted!: () => void;
+  const firstStartedPromise = new Promise<void>((resolve) => { firstStarted = resolve; });
+  let releaseFirst!: () => void;
+  const firstCanFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let writes = 0;
+  const queue = createIngestionQueue(async (batch) => {
+    writes += 1;
+    if (writes === 1) {
+      firstStarted();
+      await firstCanFinish;
+    }
+    written.push(...batch.map(({ entry }) => entry.message));
+  }, { maxLogs: 10, maxDelayMs: 60_000 });
+
+  const expected = Array.from({ length: 1_100 }, (_, index) => String(index));
+  const pending = expected.map((message) => queue.enqueue("default", [log(message)]));
+  await firstStartedPromise;
+  releaseFirst();
+  await Promise.all(pending);
+  assert.deepEqual(written, expected);
+});

@@ -22,6 +22,7 @@ export function createIngestionQueue(
   onFlushError: (error: unknown) => void = (error) => console.error("Ingestion flush failed:", error),
 ) {
   let pending: PendingIngestion[] = [];
+  let pendingHead = 0;
   let pendingLogs = 0;
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
   const activeFlushes = new Set<Promise<void>>();
@@ -36,22 +37,35 @@ export function createIngestionQueue(
   function takeFlushBatch() {
     const batch: PendingIngestion[] = [];
     let logCount = 0;
-    while (pending.length > 0) {
-      const next = pending[0];
+    while (pendingHead < pending.length) {
+      const next = pending[pendingHead]!;
       // Keep one HTTP request together. This retains the all-or-nothing behavior
       // of a request's valid entries even when multiple requests share one COPY.
       if (batch.length > 0 && logCount + next.entries.length > options.maxLogs) break;
-      pending.shift();
+      pendingHead += 1;
       pendingLogs -= next.entries.length;
       batch.push(next);
       logCount += next.entries.length;
+    }
+    // Avoid Array#shift(), which repeatedly reindexes a backlog of small HTTP
+    // requests. Compact only after a batch so dequeueing stays O(1).
+    if (pendingHead === pending.length) {
+      pending = [];
+      pendingHead = 0;
+    } else if (pendingHead >= 1_024 && pendingHead * 2 >= pending.length) {
+      pending = pending.slice(pendingHead);
+      pendingHead = 0;
     }
     return batch;
   }
 
   function oldestPendingAgeMs() {
-    const oldest = pending[0];
+    const oldest = pending[pendingHead];
     return oldest ? Date.now() - oldest.enqueuedAt : 0;
+  }
+
+  function hasPending() {
+    return pendingHead < pending.length;
   }
 
   function shouldFlush() {
@@ -76,27 +90,27 @@ export function createIngestionQueue(
   }
 
   function startFlushes(force = false) {
-    if (pending.length === 0) return;
+    if (!hasPending()) return;
     if (force || shouldFlush()) clearFlushTimer();
 
     while (
-      pending.length > 0
+      hasPending()
       && activeFlushes.size < maxConcurrentFlushes
       && (force || shouldFlush())
     ) {
       let current!: Promise<void>;
       current = flushOneBatch().finally(() => {
         activeFlushes.delete(current);
-        if (pending.length > 0) scheduleFlush();
+        if (hasPending()) scheduleFlush();
       });
       activeFlushes.add(current);
     }
   }
 
   function scheduleFlush() {
-    if (pending.length === 0) return;
+    if (!hasPending()) return;
     startFlushes();
-    if (pending.length === 0) return;
+    if (!hasPending()) return;
 
     // Requests accumulated while every writer was busy have already spent
     // their batching wait. As soon as a writer frees up, start them instead
@@ -107,7 +121,7 @@ export function createIngestionQueue(
     }
 
     if (
-      pending.length > 0
+      hasPending()
       && activeFlushes.size < maxConcurrentFlushes
       && !flushTimer
     ) {
@@ -134,7 +148,7 @@ export function createIngestionQueue(
 /** Drain queued writes before database shutdown so accepted requests are never lost. */
   async function flushPending() {
     clearFlushTimer();
-    while (pending.length > 0 || activeFlushes.size > 0) {
+    while (hasPending() || activeFlushes.size > 0) {
       startFlushes(true);
       if (activeFlushes.size > 0) {
         await Promise.race(activeFlushes);

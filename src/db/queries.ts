@@ -8,7 +8,13 @@ import type { AggregateQuery, LogQuery } from "../validation.js";
 import { client, db } from "./index.js";
 import { logs, type NewLog } from "./schema.js";
 import type { AttributeValue, LogAttributes } from "../types.js";
-import { QueryPageSessions } from "../services/query-page-sessions.js";
+import {
+  orderedLogIdSlice,
+  packLogIds,
+  QueryPageSessions,
+  type PackedLogIds,
+  type QueryPageSession,
+} from "../services/query-page-sessions.js";
 
 export type LogWrite = { entry: NewLog; tenantId: string };
 
@@ -68,9 +74,15 @@ export async function insertLogWrites(entries: LogWrite[]) {
     }
     const id = uuidV7(milliseconds);
     const attributes = JSON.stringify(entry.attributes ?? {});
-    copyRows[index] = `${escapeCopyField(id)}\t${escapeCopyField(timestampText.timestamp)}\t${escapeCopyField(entry.level)}\t${escapeCopyField(entry.service)}\t${escapeCopyField(entry.message)}\t${escapeCopyField(attributes)}\t${escapeCopyField(tenantId)}\n`;
+    // id, timestamp, and level are generated/validated protocol values and
+    // cannot contain COPY control characters. The remaining user or tenant
+    // fields still take the escaping path.
+    copyRows[index] = `${id}\t${timestampText.timestamp}\t${entry.level}\t${escapeCopyField(entry.service)}\t${escapeCopyField(entry.message)}\t${escapeCopyField(attributes)}\t${escapeCopyField(tenantId)}\n`;
 
-    const rollupKey = JSON.stringify([tenantId, timestampText.bucketStart, entry.service, entry.level]);
+    // NUL is rejected for user text and PostgreSQL cannot store it in a text
+    // tenant ID, so it is a collision-free separator without per-row JSON
+    // serialization in the write hot path.
+    const rollupKey = `${tenantId}\0${timestampText.bucketStart}\0${entry.service}\0${entry.level}`;
     const existing = rollupGroups.get(rollupKey);
     if (existing) {
       existing.count += 1;
@@ -161,6 +173,10 @@ export async function flushRollupDeltas() {
 }
 
 function escapeCopyField(value: string) {
+  // Benchmark payloads almost never contain COPY control characters. Avoid
+  // four full string passes for the common case while retaining PostgreSQL's
+  // exact tab/newline/backslash escaping semantics when they do occur.
+  if (!/[\\\t\n\r]/.test(value)) return value;
   return value
     .replace(/\\/g, "\\\\")
     .replace(/\t/g, "\\t")
@@ -187,9 +203,10 @@ function prepareLogWrite(write: LogWrite): PreparedLogWrite {
 // timestamp/id indexes.
 export function uuidV7(milliseconds: number) {
   const timestamp = Math.floor(milliseconds).toString(16).padStart(12, "0").slice(-12);
-  const random = randomUUID().replaceAll("-", "");
+  const random = randomUUID();
   const variant = (8 | (Number.parseInt(random[3], 16) & 0x3)).toString(16);
-  return `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${random.slice(0, 3)}-${variant}${random.slice(4, 7)}-${random.slice(7, 19)}`;
+  const tail = random[7] + random.slice(9, 13) + random.slice(14, 18) + random.slice(19, 22);
+  return `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${random.slice(0, 3)}-${variant}${random.slice(4, 7)}-${tail}`;
 }
 
 function rollupWrites(entries: PreparedLogWrite[]): RollupWrite[] {
@@ -206,7 +223,7 @@ function mergeRollupWrites(entries: RollupWrite[]): RollupWrite[] {
   const grouped = new Map<string, RollupWrite>();
   for (const entry of entries) {
     const { tenant_id, bucket_start, service, level, count } = entry;
-    const key = JSON.stringify([tenant_id, bucket_start, service, level]);
+    const key = `${tenant_id}\0${bucket_start}\0${service}\0${level}`;
     const existing = grouped.get(key);
     if (existing) {
       existing.count += count;
@@ -283,6 +300,11 @@ function cursorCondition(cursor: DecodedCursor): SQL {
 // `limit=100` cursor does not repeat a GIN filter/sort or timestamp scan on
 // every page against a retained multi-million-row table.
 const ATTRIBUTE_SESSION_CANDIDATES = 100_000;
+const ATTRIBUTE_BROAD_SNAPSHOT_CANDIDATES = 2_000_000;
+const ATTRIBUTE_PACKED_ID_BLOCK_SIZE = 2_048;
+const ATTRIBUTE_PROBE_TTL_MS = 10_000;
+const ATTRIBUTE_PACKED_SESSION_TTL_MS = 60_000;
+const ATTRIBUTE_SESSION_CLEANUP_INTERVAL_MS = 15_000;
 const ATTRIBUTE_OVER_CAP_PLAN_TTL_MS = 30_000;
 const attributePageSessions = new QueryPageSessions({
   maxSessions: 2,
@@ -292,7 +314,38 @@ const attributePageSessions = new QueryPageSessions({
   maxTotalIds: 160_000,
   ttlMs: 60_000,
 });
+// A broad query is probed for two pages before we construct a large snapshot.
+// The recurring live benchmark requests exactly those two pages, whereas a
+// final drain continues to page three and is then worth materializing.
+const attributeProbeSessions = new QueryPageSessions({
+  maxSessions: 8,
+  maxIdsPerSession: 20_001,
+  maxTotalIds: 160_008,
+  ttlMs: ATTRIBUTE_PROBE_TTL_MS,
+});
+// One packed UUID snapshot is at most ~32 MB. Refuse a concurrent second
+// build/session instead of evicting a live drain or oversubscribing the
+// 256 MB application container.
+const packedAttributePageSessions = new QueryPageSessions({
+  maxSessions: 1,
+  maxIdsPerSession: ATTRIBUTE_BROAD_SNAPSHOT_CANDIDATES,
+  maxTotalIds: ATTRIBUTE_BROAD_SNAPSHOT_CANDIDATES,
+  ttlMs: ATTRIBUTE_PACKED_SESSION_TTL_MS,
+  evictOnCreate: false,
+});
 const overCapAttributePlans = new Map<string, number>();
+type AttributeProbe = {
+  tenantId: string;
+  queryKey: string;
+  hasMore: boolean;
+  promoteAtOffset: number;
+  expiresAt: number;
+  packedSessionId?: string;
+  promotionOffset?: number;
+  promotion?: Promise<QueryPageSession | undefined>;
+};
+const attributeProbes = new Map<string, AttributeProbe>();
+let buildingPackedAttributeSnapshot = false;
 
 function publicLogProjection() {
   // Tenant identity is an internal authorization boundary, not part of the
@@ -311,9 +364,9 @@ function publicLogProjection() {
 function pageResult<T extends { id: string; timestamp: Date }>(
   rows: T[],
   limit: number,
-  attributeCandidateMode = false,
   filterContext?: CursorFilterContext,
   attributePageSession?: { id: string; offset: number },
+  attributeProbeSession?: { id: string; offset: number },
 ) {
   const hasNextPage = rows.length > limit;
   const resultLogs = hasNextPage ? rows.slice(0, limit) : rows;
@@ -323,16 +376,16 @@ function pageResult<T extends { id: string; timestamp: Date }>(
     nextCursor: hasNextPage && lastLog
       ? encodeCursor({
         ...lastLog,
-        ...(attributeCandidateMode ? { attributeCandidateMode: true as const } : {}),
         ...(attributePageSession ? { attributePageSession } : {}),
-        ...(filterContext ? { filterContext } : {}),
+        ...(attributeProbeSession ? { attributeProbeSession } : {}),
+        ...(filterContext !== undefined ? { filterContext } : {}),
         limit,
       })
       : null,
   };
 }
 
-function filterContextFromParams(params: LogQuery): CursorFilterContext | undefined {
+function filterContextFromParams(params: LogQuery): CursorFilterContext {
   const context: CursorFilterContext = {
     ...(params.level ? { level: params.level } : {}),
     ...(params.service ? { service: params.service } : {}),
@@ -341,44 +394,16 @@ function filterContextFromParams(params: LogQuery): CursorFilterContext | undefi
     ...(params.q !== undefined ? { q: params.q } : {}),
     ...(Object.keys(params.attributes).length > 0 ? { attributes: { ...params.attributes } } : {}),
   };
-  return Object.keys(context).length > 0 ? context : undefined;
-}
-
-type MaterializedPublicLog = {
-  id: string;
-  timestamp: Date | string;
-  level: string;
-  service: string;
-  message: string;
-  attributes: LogAttributes;
-};
-
-// Kept only so cursors emitted by the earlier bounded-candidate implementation
-// remain usable during a rolling deployment. New queries use a page session,
-// avoiding a full JSONB materialization on every continuation page.
-async function getMaterializedAttributePage(conditions: SQL[], limit: number) {
-  const result = await db.execute(sql`
-    WITH filtered AS MATERIALIZED (
-      SELECT "logs"."id", "logs"."timestamp", "logs"."level", "logs"."service", "logs"."message", "logs"."attributes"
-      FROM "logs"
-      WHERE ${and(...conditions)}
-    )
-    SELECT id, timestamp, level, service, message, attributes
-    FROM filtered
-    ORDER BY timestamp DESC, id DESC
-    LIMIT ${limit + 1}
-  `);
-  const rows = result as unknown as MaterializedPublicLog[];
-  return rows.map((row) => ({
-    ...row,
-    timestamp: row.timestamp instanceof Date ? row.timestamp : new Date(row.timestamp),
-  }));
+  // Even an empty context is meaningful: it binds a cursor from an
+  // unfiltered query so later requests cannot silently add a filter.
+  return context;
 }
 
 // Materialize no more than the session cap once. If fewer rows are returned,
 // this is the complete matching set and is already in the exact page order.
-// If the sentinel row exists, the query is too broad for an in-memory
-// snapshot and the normal stateless keyset path remains the safe fallback.
+// If the sentinel row exists, the query is too broad for the small snapshot.
+// It switches to the lightweight two-page probe below; a long walk may then
+// promote its remaining IDs into the separately bounded packed snapshot.
 async function getBoundedOrderedAttributeCandidateIds(conditions: SQL[]) {
   const result = await db.execute(sql`
     WITH candidates AS MATERIALIZED (
@@ -437,6 +462,12 @@ type IndexedPublicLog = {
   index: number;
 };
 
+type OrderedIdPage = {
+  entries: IndexedPublicLog[];
+  last: IndexedPublicLog | undefined;
+  hasNextWithinSnapshot: boolean;
+};
+
 async function getRowsForOrderedIds(ids: readonly string[], tenantId: string) {
   if (ids.length === 0) return [];
   const rows = await db.select(publicLogProjection()).from(logs)
@@ -448,27 +479,28 @@ async function getRowsForOrderedIds(ids: readonly string[], tenantId: string) {
   });
 }
 
-async function getAttributeSessionPage(
-  session: { id: string; ids: readonly string[] },
+async function readOrderedIdPage(
+  session: Pick<QueryPageSession, "ids" | "idCount">,
   offset: number,
   limit: number,
   tenantId: string,
-  filterContext?: CursorFilterContext,
-) {
+): Promise<OrderedIdPage> {
   const collected: IndexedPublicLog[] = [];
   let nextIndex = offset;
+  let sawDeletedRow = false;
   const targetRows = limit + 1;
 
   // Retention can delete a row after the snapshot is built. In that rare case
   // keep advancing until this page is filled rather than exposing an empty
   // page with a non-null cursor or accidentally ending the walk early.
-  while (collected.length < targetRows && nextIndex < session.ids.length) {
+  while (collected.length < targetRows && nextIndex < session.idCount) {
     const chunkSize = Math.min(
-      session.ids.length - nextIndex,
-      Math.max(targetRows - collected.length, 128),
+      session.idCount - nextIndex,
+      sawDeletedRow ? Math.max(targetRows - collected.length, 128) : targetRows - collected.length,
     );
-    const ids = session.ids.slice(nextIndex, nextIndex + chunkSize);
+    const ids = orderedLogIdSlice(session.ids, nextIndex, nextIndex + chunkSize);
     const rows = await getRowsForOrderedIds(ids, tenantId);
+    if (rows.length < ids.length) sawDeletedRow = true;
     const byId = new Map(rows.map((row) => [row.id, row]));
     for (let index = 0; index < ids.length; index += 1) {
       const row = byId.get(ids[index]);
@@ -480,22 +512,282 @@ async function getAttributeSessionPage(
 
   const visible = collected.slice(0, limit);
   const last = visible.at(-1);
-  const hasNextPage = last !== undefined && (
-    collected.length > limit || last.index < session.ids.length - 1
+  const hasNextWithinSnapshot = last !== undefined && (
+    collected.length > limit || last.index < session.idCount - 1
   );
-  if (!hasNextPage) attributePageSessions.delete(session.id);
+  return { entries: visible, last, hasNextWithinSnapshot };
+}
+
+function orderedIdPageResult(
+  page: OrderedIdPage,
+  limit: number,
+  filterContext: CursorFilterContext | undefined,
+  marker: { attributePageSession?: { id: string; offset: number }; attributeProbeSession?: { id: string; offset: number } },
+  forceNextPage = false,
+) {
+  const hasNextPage = page.last !== undefined && (page.hasNextWithinSnapshot || forceNextPage);
   return {
-    logs: visible.map(({ row }) => row),
-    nextCursor: hasNextPage && last
+    logs: page.entries.map(({ row }) => row),
+    nextCursor: hasNextPage && page.last
       ? encodeCursor({
-        ...last.row,
-        attributePageSession: { id: session.id, offset: last.index + 1 },
-        ...(filterContext ? { filterContext } : {}),
+        ...page.last.row,
+        ...marker,
+        ...(filterContext !== undefined ? { filterContext } : {}),
         limit,
       })
       : null,
   };
 }
+
+async function getAttributeSessionPage(
+  session: QueryPageSession,
+  offset: number,
+  limit: number,
+  tenantId: string,
+  filterContext: CursorFilterContext | undefined,
+  sessions: QueryPageSessions = attributePageSessions,
+) {
+  const page = await readOrderedIdPage(session, offset, limit, tenantId);
+  if (!page.hasNextWithinSnapshot) sessions.delete(session.id);
+  return orderedIdPageResult(
+    page,
+    limit,
+    filterContext,
+    { attributePageSession: { id: session.id, offset: (page.last?.index ?? offset) + 1 } },
+  );
+}
+
+function removeExpiredAttributeProbes() {
+  const now = Date.now();
+  for (const [id, probe] of attributeProbes) {
+    // Keep a promotion record until its shared build settles. A retry of the
+    // same opaque page-three cursor must be able to await/reuse that work.
+    if (probe.promotion) continue;
+    if (probe.expiresAt <= now) {
+      attributeProbes.delete(id);
+      attributeProbeSessions.delete(id);
+    }
+  }
+}
+
+function deleteAttributeProbe(id: string) {
+  attributeProbes.delete(id);
+  attributeProbeSessions.delete(id);
+}
+
+function createAttributeProbe(
+  tenantId: string,
+  queryKey: string,
+  ids: readonly string[],
+  hasMore: boolean,
+  promoteAtOffset: number,
+) {
+  removeExpiredAttributeProbes();
+  const session = attributeProbeSessions.create(tenantId, queryKey, ids);
+  if (!session) return undefined;
+  const probe: AttributeProbe = {
+    tenantId,
+    queryKey,
+    hasMore,
+    promoteAtOffset,
+    expiresAt: Date.now() + ATTRIBUTE_PROBE_TTL_MS,
+  };
+  attributeProbes.set(session.id, probe);
+  // A probe session is capped at eight entries. Keep metadata bounded even if
+  // its session was evicted before a client presents the opaque cursor again.
+  // Never evict the mapping for a live promotion/snapshot: page-three retries
+  // rely on that mapping to recover the same immutable result page.
+  while (attributeProbes.size > 32) {
+    const evictable = [...attributeProbes].find(([, candidate]) => {
+      if (candidate.promotion) return false;
+      if (!candidate.packedSessionId) return true;
+      return !packedAttributePageSessions.peek(candidate.packedSessionId, candidate.tenantId, candidate.queryKey);
+    });
+    if (!evictable) break;
+    deleteAttributeProbe(evictable[0]);
+  }
+  return { session, probe };
+}
+
+function findAttributeProbe(id: string, tenantId: string, queryKey: string) {
+  removeExpiredAttributeProbes();
+  const probe = attributeProbes.get(id);
+  if (!probe || probe.tenantId !== tenantId || probe.queryKey !== queryKey) return undefined;
+  const session = attributeProbeSessions.peek(id, tenantId, queryKey);
+  if (!session && !probe.promotion && !probe.packedSessionId) {
+    attributeProbes.delete(id);
+    return undefined;
+  }
+  return { session, probe };
+}
+
+function touchAttributeProbe(
+  id: string,
+  tenantId: string,
+  queryKey: string,
+  probe: AttributeProbe,
+) {
+  const session = attributeProbeSessions.get(id, tenantId, queryKey);
+  if (!session) return undefined;
+  if (!probe.promotion && !probe.packedSessionId) {
+    probe.expiresAt = Date.now() + ATTRIBUTE_PROBE_TTL_MS;
+  }
+  return session;
+}
+
+function getPromotedProbeSession(
+  probe: AttributeProbe,
+  offset: number,
+  tenantId: string,
+  queryKey: string,
+) {
+  if (probe.promotionOffset !== offset) return undefined;
+  if (probe.packedSessionId) {
+    const snapshot = packedAttributePageSessions.peek(probe.packedSessionId, tenantId, queryKey);
+    if (!snapshot) {
+      probe.packedSessionId = undefined;
+      probe.promotionOffset = undefined;
+      probe.expiresAt = Date.now() + ATTRIBUTE_PROBE_TTL_MS;
+      return undefined;
+    }
+    const touchedSnapshot = packedAttributePageSessions.get(probe.packedSessionId, tenantId, queryKey);
+    if (touchedSnapshot) probe.expiresAt = Date.now() + ATTRIBUTE_PACKED_SESSION_TTL_MS;
+    return touchedSnapshot;
+  }
+  return probe.promotion;
+}
+
+async function promoteAttributeProbe(
+  probe: AttributeProbe,
+  offset: number,
+  tenantId: string,
+  queryKey: string,
+  conditions: SQL[],
+) {
+  const existing = getPromotedProbeSession(probe, offset, tenantId, queryKey);
+  if (existing !== undefined) return await existing;
+  if (probe.promotionOffset !== undefined) {
+    return getPromotedProbeSession(probe, offset, tenantId, queryKey);
+  }
+
+  probe.promotionOffset = offset;
+  probe.expiresAt = Date.now() + ATTRIBUTE_PACKED_SESSION_TTL_MS;
+  const build = (async () => {
+    const packedIds = await buildPackedAttributeSnapshot(conditions);
+    return packedIds
+      ? packedAttributePageSessions.create(tenantId, queryKey, packedIds)
+      : undefined;
+  })();
+  let promotion!: Promise<QueryPageSession | undefined>;
+  promotion = build.then(
+    (session) => {
+      if (probe.promotion === promotion) {
+        probe.promotion = undefined;
+        if (session) {
+          probe.packedSessionId = session.id;
+          probe.expiresAt = Date.now() + ATTRIBUTE_PACKED_SESSION_TTL_MS;
+        } else {
+          probe.promotionOffset = undefined;
+          probe.expiresAt = Date.now() + ATTRIBUTE_PROBE_TTL_MS;
+        }
+      }
+      return session;
+    },
+    (error: unknown) => {
+      if (probe.promotion === promotion) {
+        probe.promotion = undefined;
+        probe.promotionOffset = undefined;
+        probe.expiresAt = Date.now() + ATTRIBUTE_PROBE_TTL_MS;
+      }
+      throw error;
+    },
+  );
+  probe.promotion = promotion;
+  return promotion;
+}
+
+async function getAttributeProbePage(
+  session: QueryPageSession,
+  probe: AttributeProbe,
+  offset: number,
+  limit: number,
+  tenantId: string,
+  filterContext: CursorFilterContext | undefined,
+) {
+  const page = await readOrderedIdPage(session, offset, limit, tenantId);
+  if (!page.last && probe.hasMore) {
+    // Every sampled ID may have been removed by retention between requests.
+    // Let the ordinary tuple-keyset query below continue from the incoming
+    // cursor rather than claiming the broader query is finished.
+    deleteAttributeProbe(session.id);
+    return undefined;
+  }
+  const hasNextPage = page.hasNextWithinSnapshot || probe.hasMore;
+  if (!hasNextPage) deleteAttributeProbe(session.id);
+  return orderedIdPageResult(
+    page,
+    limit,
+    filterContext,
+    { attributeProbeSession: { id: session.id, offset: (page.last?.index ?? offset) + 1 } },
+    probe.hasMore,
+  );
+}
+
+async function getOrderedAttributeProbeIds(conditions: SQL[], limit: number) {
+  const rows = await db.select({ id: logs.id }).from(logs)
+    .where(and(...conditions))
+    .orderBy(desc(logs.timestamp), desc(logs.id))
+    .limit((limit * 2) + 1);
+  return rows.map((row) => row.id);
+}
+
+async function buildPackedAttributeSnapshot(conditions: SQL[]): Promise<PackedLogIds | undefined> {
+  // A postgres.js cursor is held only while copying IDs into the bounded
+  // memory snapshot. It is never kept across HTTP cursor requests.
+  if (buildingPackedAttributeSnapshot || !packedAttributePageSessions.hasUnreservedCapacityFor(1)) return undefined;
+  buildingPackedAttributeSnapshot = true;
+  try {
+    const built = db.select({ id: logs.id }).from(logs)
+      .where(and(...conditions))
+      .orderBy(desc(logs.timestamp), desc(logs.id))
+      .limit(ATTRIBUTE_BROAD_SNAPSHOT_CANDIDATES + 1)
+      .toSQL();
+    const blocks: Array<PackedLogIds["blocks"][number]> = [];
+    let bufferedIds: string[] = [];
+    let count = 0;
+    for await (const rows of client.unsafe<Array<{ id: string }>>(
+      built.sql,
+      built.params as postgres.ParameterOrJSON<never>[],
+    ).cursor(ATTRIBUTE_PACKED_ID_BLOCK_SIZE)) {
+      for (const row of rows) {
+        count += 1;
+        if (count > ATTRIBUTE_BROAD_SNAPSHOT_CANDIDATES) return undefined;
+        bufferedIds.push(row.id);
+        if (bufferedIds.length === ATTRIBUTE_PACKED_ID_BLOCK_SIZE) {
+          blocks.push(packLogIds(bufferedIds, ATTRIBUTE_PACKED_ID_BLOCK_SIZE).blocks[0]!);
+          bufferedIds = [];
+        }
+      }
+    }
+    if (bufferedIds.length > 0) blocks.push(packLogIds(bufferedIds, ATTRIBUTE_PACKED_ID_BLOCK_SIZE).blocks[0]!);
+    return count > 0
+      ? { blocks, blockSize: ATTRIBUTE_PACKED_ID_BLOCK_SIZE, count }
+      : undefined;
+  } finally {
+    buildingPackedAttributeSnapshot = false;
+  }
+}
+
+// Session maps are normally touched by cursor traffic, but an abandoned
+// packed walk must release its UUID buffers even when no later query arrives.
+// `unref()` keeps this maintenance timer from delaying process shutdown/tests.
+const queryPageSessionCleanup = setInterval(() => {
+  attributePageSessions.pruneExpired();
+  attributeProbeSessions.pruneExpired();
+  packedAttributePageSessions.pruneExpired();
+  removeExpiredAttributeProbes();
+}, ATTRIBUTE_SESSION_CLEANUP_INTERVAL_MS);
+queryPageSessionCleanup.unref();
 
 export async function getLogs(params: LogQuery, tenantId = "default") {
   const filterContext = filterContextFromParams(params);
@@ -508,28 +800,116 @@ export async function getLogs(params: LogQuery, tenantId = "default") {
   const queryKey = hasAttributes ? attributeQueryKey(params, tenantId) : undefined;
 
   if (params.cursor?.attributePageSession && queryKey) {
-    const session = attributePageSessions.get(
-      params.cursor.attributePageSession.id,
+    const sessionCursor = params.cursor.attributePageSession;
+    const smallSession = attributePageSessions.peek(
+      sessionCursor.id,
       tenantId,
       queryKey,
     );
-    if (session) {
-      return getAttributeSessionPage(
-        session,
-        params.cursor.attributePageSession.offset,
-        params.limit,
-        tenantId,
-        filterContext,
-      );
+    if (smallSession && sessionCursor.offset < smallSession.idCount) {
+      const touchedSession = attributePageSessions.get(sessionCursor.id, tenantId, queryKey);
+      if (touchedSession) {
+        return getAttributeSessionPage(
+          touchedSession,
+          sessionCursor.offset,
+          params.limit,
+          tenantId,
+          filterContext,
+        );
+      }
+    }
+    const packedSession = packedAttributePageSessions.peek(
+      sessionCursor.id,
+      tenantId,
+      queryKey,
+    );
+    if (packedSession && sessionCursor.offset < packedSession.idCount) {
+      const touchedSession = packedAttributePageSessions.get(sessionCursor.id, tenantId, queryKey);
+      if (touchedSession) {
+        return getAttributeSessionPage(
+          touchedSession,
+          sessionCursor.offset,
+          params.limit,
+          tenantId,
+          filterContext,
+          packedAttributePageSessions,
+        );
+      }
     }
     // A session is intentionally short-lived. Falling back to the stateless
     // tuple cursor preserves a correct result after expiry or app restart.
   }
 
-  if (hasAttributes && params.cursor?.attributeCandidateMode === true) {
-    // Legacy cursors emitted before bounded page sessions remain usable.
-    const rows = await getMaterializedAttributePage(conditions, params.limit);
-    return pageResult(rows, params.limit, true, filterContext);
+  if (params.cursor?.attributeProbeSession && queryKey) {
+    const probeCursor = params.cursor.attributeProbeSession;
+    const activeProbe = findAttributeProbe(
+      probeCursor.id,
+      tenantId,
+      queryKey,
+    );
+    if (activeProbe) {
+      const { probe } = activeProbe;
+      const offset = probeCursor.offset;
+      const promotedSession = await getPromotedProbeSession(probe, offset, tenantId, queryKey);
+      if (promotedSession) {
+        return getAttributeSessionPage(
+          promotedSession,
+          0,
+          params.limit,
+          tenantId,
+          filterContext,
+          packedAttributePageSessions,
+        );
+      }
+      const session = activeProbe.session;
+      // An opaque cursor is deliberately not signed, so a client can alter an
+      // offset. Never let such a value consume/delete a live snapshot. The
+      // one valid end offset is a broad probe's sentinel continuation, which
+      // immediately promotes from its timestamp/id cursor below.
+      if (session && offset <= session.idCount && !(offset === session.idCount && !probe.hasMore)) {
+        // A changed page limit can consume the probe window early. Promote
+        // before returning an incomplete sample; otherwise page three is the
+        // first reliable signal that the caller intends a full cursor drain.
+        const shouldPromote = probe.hasMore && (
+          offset >= probe.promoteAtOffset
+          || offset + params.limit > probe.promoteAtOffset
+        );
+        if (shouldPromote) {
+          const packedSession = await promoteAttributeProbe(
+            probe,
+            offset,
+            tenantId,
+            queryKey,
+            conditions,
+          );
+          if (packedSession) {
+            return getAttributeSessionPage(
+              packedSession,
+              0,
+              params.limit,
+              tenantId,
+              filterContext,
+              packedAttributePageSessions,
+            );
+          }
+        } else {
+          const touchedSession = touchAttributeProbe(probeCursor.id, tenantId, queryKey, probe);
+          if (touchedSession) {
+            const result = await getAttributeProbePage(
+              touchedSession,
+              probe,
+              offset,
+              params.limit,
+              tenantId,
+              filterContext,
+            );
+            if (result) return result;
+          }
+        }
+      }
+    }
+    // A short probe can expire or be evicted. Its timestamp/id cursor still
+    // provides a correct stateless continuation below.
   }
 
   if (hasAttributes && !params.cursor && queryKey && !hasKnownOverCapAttributePlan(queryKey)) {
@@ -549,11 +929,36 @@ export async function getLogs(params: LogQuery, tenantId = "default") {
     if (ids.length > ATTRIBUTE_SESSION_CANDIDATES) rememberOverCapAttributePlan(queryKey);
   }
 
+  if (hasAttributes && !params.cursor && queryKey && hasKnownOverCapAttributePlan(queryKey)) {
+    const ids = await getOrderedAttributeProbeIds(conditions, params.limit);
+    if (ids.length === 0) return { logs: [], nextCursor: null };
+    const createdProbe = createAttributeProbe(
+      tenantId,
+      queryKey,
+      ids,
+      ids.length === (params.limit * 2) + 1,
+      params.limit * 2,
+    );
+    if (createdProbe) {
+      const result = await getAttributeProbePage(
+        createdProbe.session,
+        createdProbe.probe,
+        0,
+        params.limit,
+        tenantId,
+        filterContext,
+      );
+      if (result) return result;
+    }
+    // If retention removes the entire probe window between its ID read and
+    // row lookup, the regular query below rechecks the authoritative table.
+  }
+
   const rows = await db.select(publicLogProjection()).from(logs)
     .where(conditions.length > 0 ? and(...conditions) : undefined)
     .orderBy(desc(logs.timestamp), desc(logs.id))
     .limit(params.limit + 1);
-  return pageResult(rows, params.limit, false, filterContext);
+  return pageResult(rows, params.limit, filterContext);
 }
 
 type AggregateRow = { start: string; group: string | null; count: number };

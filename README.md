@@ -56,7 +56,7 @@ Supports freely combinable filters: `service`, `level`, `since`, `until`, `q`, a
 { "logs": [], "next_cursor": null }
 ```
 
-When another page exists, `next_cursor` is an opaque encoded value; pass it unchanged as `cursor` for the next page. Attribute-filtered result sets up to 100,000 matching rows use a short-lived, bounded server-side ID snapshot so explicit small pages do not repeat a JSONB filter and sort for every continuation. The cursor remains retry-safe and falls back to ordinary keyset paging after a restart or session expiry. Invalid parameters return `{ "error": "..." }` with `400`.
+When another page exists, `next_cursor` is an opaque encoded value; pass it unchanged as `cursor` for the next page. Attribute-filtered result sets up to 100,000 matching rows use a short-lived, bounded server-side ID snapshot so explicit small pages do not repeat a JSONB filter and sort for every continuation. Broader attribute walks first keep only a two-page ID probe; if a caller actually requests page three, the remaining IDs are streamed into one bounded, packed UUID snapshot (up to 2,000,000 rows). This avoids rebuilding a million-row plan for every page without making the recurring two-page live probe allocate that snapshot. The cursor remains retry-safe and falls back to ordinary keyset paging after a restart, expiry, or bounded-capacity decision. Invalid parameters return `{ "error": "..." }` with `400`.
 
 ### `GET /logs/aggregate`
 

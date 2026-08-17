@@ -62,16 +62,15 @@ function parseTimestamp(value: unknown, field: string, requireIsoFormat: boolean
 
 function validateAttributes(value: unknown): LogAttributes {
   if (!isPlainObject(value)) throw new ApiError("attributes must be a flat object");
-  // Define keys rather than assigning them so valid JSON keys such as
-  // "__proto__" remain own properties instead of invoking a legacy setter.
-  const attributes: LogAttributes = {};
-  for (const [key, attributeValue] of Object.entries(value)) {
+  for (const key of Object.keys(value)) {
+    const attributeValue = value[key];
     // Attribute keys are otherwise intentionally unconstrained by the core
     // ingestion contract. Empty keys cannot be addressed through `attr.*`,
     // and NUL cannot be stored by PostgreSQL in JSONB.
     if (!key) throw new ApiError("attribute keys must not be empty");
     if (key.includes("\0")) throw new ApiError("attribute keys must not contain NUL characters");
-    if (typeof attributeValue === "object" || typeof attributeValue === "undefined" || !["string", "number", "boolean"].includes(typeof attributeValue)) {
+    const valueType = typeof attributeValue;
+    if (valueType !== "string" && valueType !== "number" && valueType !== "boolean") {
       throw new ApiError("attributes values must be strings, numbers, or booleans");
     }
     if (typeof attributeValue === "number" && !Number.isFinite(attributeValue)) {
@@ -80,14 +79,11 @@ function validateAttributes(value: unknown): LogAttributes {
     if (typeof attributeValue === "string" && attributeValue.includes("\0")) {
       throw new ApiError("attributes values must not contain NUL characters");
     }
-    Object.defineProperty(attributes, key, {
-      value: attributeValue as string | number | boolean,
-      enumerable: true,
-      configurable: true,
-      writable: true,
-    });
   }
-  return attributes;
+  // JSON parsing already creates own data properties, including a literal
+  // "__proto__" key. Returning the validated object avoids copying every
+  // attribute in the ingestion hot path while preserving that behavior.
+  return value as LogAttributes;
 }
 
 function validateLog(value: unknown, timestamps?: Map<string, Date>): NewLog {

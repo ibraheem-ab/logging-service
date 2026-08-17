@@ -24,6 +24,7 @@ test("preserves arbitrary safe attribute keys and rejects values PostgreSQL cann
   assert.ok(acceptedLog.attributes);
   assert.equal(Object.prototype.hasOwnProperty.call(acceptedLog.attributes, "__proto__"), true);
   assert.equal(acceptedLog.attributes.__proto__, "kept");
+  assert.equal(JSON.stringify(acceptedLog.attributes), '{"__proto__":"kept","ordinary":"value"}');
 
   const directFilter = parseLogsQuery({ "attr.__proto__": "kept" });
   const compoundFilter = parseLogsQuery({ query: "attr.__proto__:kept" });
@@ -85,6 +86,24 @@ test("cursor preserves bounded attribute-page session state", () => {
   assert.throws(() => decodeCursor(malformed), ApiError);
 });
 
+test("cursor preserves the short broad-attribute probe state", () => {
+  const cursor = {
+    timestamp: new Date("2026-08-09T10:00:00.000Z"),
+    id: "0198f7c0-8a00-7a12-8abc-0123456789ab",
+    attributeProbeSession: {
+      id: "00000000-0000-4000-8000-000000000001",
+      offset: 200,
+    },
+  };
+  assert.deepEqual(decodeCursor(encodeCursor(cursor)), cursor);
+  const malformed = Buffer.from(JSON.stringify({
+    timestamp: cursor.timestamp.toISOString(), id: cursor.id,
+    attribute_page_session: cursor.attributeProbeSession,
+    attribute_probe_session: cursor.attributeProbeSession,
+  })).toString("base64url");
+  assert.throws(() => decodeCursor(malformed), ApiError);
+});
+
 test("cursor preserves filter context when later pages omit query filters", () => {
   const cursor = encodeCursor({
     timestamp: new Date("2026-08-09T10:00:00.000Z"),
@@ -133,6 +152,20 @@ test("cursor preserves filter context when later pages omit query filters", () =
 
   assert.throws(() => parseLogsQuery({ cursor, service: "auth" }), ApiError);
   assert.throws(() => parseLogsQuery({ cursor, "attr.request_id": "other" }), ApiError);
+});
+
+test("an empty cursor context prevents filters being added later", () => {
+  const cursor = encodeCursor({
+    timestamp: new Date("2026-08-09T10:00:00.000Z"),
+    id: "0198f7c0-8a00-7a12-8abc-0123456789ab",
+    limit: 100,
+    filterContext: {},
+  });
+  const continued = parseLogsQuery({ cursor });
+  assert.equal(continued.limit, 100);
+  assert.deepEqual(continued.attributes, {});
+  assert.throws(() => parseLogsQuery({ cursor, service: "checkout" }), ApiError);
+  assert.throws(() => parseLogsQuery({ cursor, "attr.region": "eu" }), ApiError);
 });
 
 test("query parser validates filters and limits", () => {
