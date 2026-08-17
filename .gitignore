@@ -16,3 +16,6 @@ yarn-debug.log*
 yarn-error.log*
 .DS_Store
 Thumbs.db
+
+# Generated temporarily by the official local benchmark CLI.
+.load-generator.compose.override.yml

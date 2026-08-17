@@ -99,6 +99,26 @@ BASE_URL=http://127.0.0.1:8086 TARGET_LOGS_PER_SECOND=15000 DURATION_SECONDS=30 
 BASE_URL=http://127.0.0.1:8086 SCENARIO=load BATCH_SIZE=32 npm run benchmark:scenarios
 ```
 
+### Published local benchmark CLI
+
+When the course's local tester is available, run it from this repository root
+with Docker Desktop already running. The pinned revision below is intentional:
+it makes the invocation reproducible while the tester is still being validated
+across operating systems.
+
+```powershell
+npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#992d9c8" --version
+npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#992d9c8" --compose ./docker-compose.yml --checks-only --seed 6122026
+npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#992d9c8" --compose ./docker-compose.yml --full --seed 6122026 --generator-cpus 2
+```
+
+The CLI starts and tears down Compose itself, applying the evaluated `0.5 CPU /
+256 MB` application and `1 CPU / 1 GB` PostgreSQL limits. Its correctness
+catalog is a strong contract check; its performance result remains
+machine-dependent, and a `dropped iterations` warning means the local score is
+diagnostic rather than a final platform grade. The generated
+`.load-generator.compose.override.yml` is intentionally ignored by Git.
+
 Optional integration tests live in `scripts/optional-*-integration.ts`. Run each against a deployment where the corresponding feature is enabled, using `BASE_URL`:
 
 ```bash

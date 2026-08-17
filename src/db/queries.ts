@@ -1011,42 +1011,78 @@ function rollupWhere(
   return and(...conditions)!;
 }
 
-async function getRollupAggregate(params: AggregateQuery, since: Date, until: Date, tenantId: string): Promise<AggregateRow[]> {
-  const mainWhere = rollupWhere(sql`t.bucket_start`, sql`t.service`, sql`t.level`, sql`t.tenant_id`, params, since, until, tenantId);
-  const deltaWhere = rollupWhere(sql`d.bucket_start`, sql`d.service`, sql`d.level`, sql`d.tenant_id`, params, since, until, tenantId);
-  const rollupTimestamp = sql`r.bucket_start`;
-  const rollupService = sql`r.service`;
-  const rollupLevel = sql`r.level`;
-  const bucket = bucketExpression(rollupTimestamp, params.bucket);
-  const group = groupExpression(params.groupBy, rollupService, rollupLevel);
-  const result = await db.execute(sql`
-    WITH rollup_rows AS (
-      SELECT t.bucket_start, t.service, t.level, t.count
-      FROM log_second_rollups AS t
-      WHERE ${mainWhere}
-      UNION ALL
-      SELECT d.bucket_start, d.service, d.level, d.count
-      FROM log_second_rollup_deltas AS d
-      WHERE ${deltaWhere}
-    )
-    SELECT ${bucket} AS start, ${group} AS "group", sum(r.count)::integer AS count
-    FROM rollup_rows AS r
+function rawAggregateSegment(params: AggregateQuery, since: Date, until: Date, tenantId: string) {
+  const effectiveParams = { ...params, since, until };
+  const bucket = bucketExpression(logs.timestamp, params.bucket);
+  const group = groupExpression(params.groupBy, logs.service, logs.level);
+  const conditions = filterConditions(effectiveParams, true);
+  conditions.push(eq(logs.tenantId, tenantId));
+  // Each raw boundary is already reduced before it joins the compact
+  // rollups. This keeps a busy fractional second from flooding the final
+  // aggregate with individual log rows.
+  return sql`
+    SELECT ${bucket} AS start, ${group} AS "group", count(*)::bigint AS count
+    FROM ${logs}
+    WHERE ${and(...conditions)!}
     GROUP BY ${bucket}, ${group}
-    ORDER BY ${bucket}, ${group}
+  `;
+}
+
+async function getRollupBackedAggregate(
+  params: AggregateQuery,
+  rollupSince: Date,
+  rollupUntil: Date,
+  tenantId: string,
+): Promise<AggregateRow[]> {
+  const since = params.since!;
+  const until = params.until!;
+  const mainTimestamp = sql`t.bucket_start`;
+  const mainService = sql`t.service`;
+  const mainLevel = sql`t.level`;
+  const deltaTimestamp = sql`d.bucket_start`;
+  const deltaService = sql`d.service`;
+  const deltaLevel = sql`d.level`;
+  const mainWhere = rollupWhere(mainTimestamp, mainService, mainLevel, sql`t.tenant_id`, params, rollupSince, rollupUntil, tenantId);
+  const deltaWhere = rollupWhere(deltaTimestamp, deltaService, deltaLevel, sql`d.tenant_id`, params, rollupSince, rollupUntil, tenantId);
+  const mainBucket = bucketExpression(mainTimestamp, params.bucket);
+  const mainGroup = groupExpression(params.groupBy, mainService, mainLevel);
+  const deltaBucket = bucketExpression(deltaTimestamp, params.bucket);
+  const deltaGroup = groupExpression(params.groupBy, deltaService, deltaLevel);
+  const segments: SQL[] = [];
+
+  if (since < rollupSince) segments.push(rawAggregateSegment(params, since, rollupSince, tenantId));
+  // Deltas are append-only, so several committed COPY batches can share a
+  // bucket and group. Reducing each table arm first is algebraically exact,
+  // while shrinking the UNION and final grouping work during ingestion.
+  segments.push(sql`
+    SELECT ${mainBucket} AS start, ${mainGroup} AS "group", sum(t.count)::bigint AS count
+    FROM log_second_rollups AS t
+    WHERE ${mainWhere}
+    GROUP BY ${mainBucket}, ${mainGroup}
+  `);
+  segments.push(sql`
+    SELECT ${deltaBucket} AS start, ${deltaGroup} AS "group", sum(d.count)::bigint AS count
+    FROM log_second_rollup_deltas AS d
+    WHERE ${deltaWhere}
+    GROUP BY ${deltaBucket}, ${deltaGroup}
+  `);
+  if (rollupUntil < until) segments.push(rawAggregateSegment(params, rollupUntil, until, tenantId));
+
+  // The old implementation made up to three sequential database round trips
+  // (raw leading edge, rollups, raw trailing edge) and merged their results in
+  // JavaScript. A single statement retains the exact half-open intervals and
+  // returns one transactionally consistent aggregate snapshot instead.
+  const result = await db.execute(sql`
+    WITH aggregate_segments AS (
+      ${sql.join(segments, sql` UNION ALL `)}
+    )
+    SELECT start, "group", sum(count)::integer AS count
+    FROM aggregate_segments
+    GROUP BY start, "group"
+    ORDER BY start, "group"
   `);
   const rows = result as unknown as Array<{ start: Date | string; group: string | null; count: number | string }>;
   return rows.map((row) => ({ start: new Date(row.start).toISOString(), group: row.group, count: Number(row.count) }));
-}
-
-function mergeAggregateRows(rows: AggregateRow[]) {
-  const combined = new Map<string, AggregateRow>();
-  for (const row of rows) {
-    const key = `${row.start}\u0000${row.group ?? ""}`;
-    const existing = combined.get(key);
-    if (existing) existing.count += row.count;
-    else combined.set(key, { ...row });
-  }
-  return [...combined.values()].sort((left, right) => left.start.localeCompare(right.start) || (left.group ?? "").localeCompare(right.group ?? ""));
 }
 
 export async function getAggregate(params: AggregateQuery, tenantId = "default") {
@@ -1057,12 +1093,7 @@ export async function getAggregate(params: AggregateQuery, tenantId = "default")
   const rollupSince = new Date(Math.ceil(since.getTime() / 1_000) * 1_000);
   const rollupUntil = new Date(Math.floor(until.getTime() / 1_000) * 1_000);
   if (rollupSince >= rollupUntil) return getRawAggregate(params, params.since, params.until, tenantId);
-
-  const rows: AggregateRow[] = [];
-  if (since < rollupSince) rows.push(...await getRawAggregate(params, since, rollupSince, tenantId));
-  rows.push(...await getRollupAggregate(params, rollupSince, rollupUntil, tenantId));
-  if (rollupUntil < until) rows.push(...await getRawAggregate(params, rollupUntil, until, tenantId));
-  return mergeAggregateRows(rows);
+  return getRollupBackedAggregate(params, rollupSince, rollupUntil, tenantId);
 }
 
 export async function deleteExpiredLogs(cutoff: Date) {
