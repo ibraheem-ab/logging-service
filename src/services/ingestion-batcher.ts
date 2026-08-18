@@ -10,3 +10,4 @@ const queue = createIngestionQueue(insertLogWrites, {
 
 export const enqueueIngestion = queue.enqueue;
 export const flushPendingIngestions = queue.flushPending;
+export const isIngestionIdleFor = queue.isIdleFor;

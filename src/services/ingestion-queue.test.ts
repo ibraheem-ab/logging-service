@@ -54,6 +54,22 @@ test("drains pending writes during shutdown instead of waiting for the normal fl
   assert.deepEqual(copies, [1]);
 });
 
+test("reports idle time only after pending and active writes finish", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const queue = createIngestionQueue(async () => {}, { maxLogs: 100, maxDelayMs: 500 });
+  assert.equal(queue.isIdleFor(100), false);
+  t.mock.timers.tick(100);
+  assert.equal(queue.isIdleFor(100), true);
+
+  const accepted = queue.enqueue("default", [log("one")]);
+  assert.equal(queue.isIdleFor(0), false);
+  await queue.flushPending();
+  await accepted;
+  assert.equal(queue.isIdleFor(100), false);
+  t.mock.timers.tick(100);
+  assert.equal(queue.isIdleFor(100), true);
+});
+
 test("flushes a lone request before the high-throughput batching deadline", async () => {
   let writerStarted!: () => void;
   const writerStartedPromise = new Promise<void>((resolve) => { writerStarted = resolve; });

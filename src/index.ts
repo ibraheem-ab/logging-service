@@ -5,11 +5,13 @@ import { flushRollupDeltas } from "./db/queries.js";
 import { startRetentionJob } from "./services/retention.js";
 import { seedLoadGeneratorKey } from "./services/auth.js";
 import { flushPendingIngestions } from "./services/ingestion-batcher.js";
+import { startRollupCompactor } from "./services/rollup-compactor.js";
 
 async function bootstrap() {
   await runMigrations();
   await seedLoadGeneratorKey();
   const stopRetentionJob = startRetentionJob();
+  const stopRollupCompactor = startRollupCompactor();
 
   const server = app.listen(config.port, () => {
     console.log(`Logging service is listening on port ${config.port}`);
@@ -19,6 +21,7 @@ async function bootstrap() {
     console.log(`${signal} received; shutting down.`);
     stopRetentionJob();
     server.close(async () => {
+      await stopRollupCompactor();
       await flushPendingIngestions();
       await flushRollupDeltas();
       await closeDatabase();

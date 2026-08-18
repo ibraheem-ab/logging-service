@@ -81,7 +81,9 @@ The `logs` table uses UUID primary keys, `timestamptz`, text columns for level/s
 - `q` remains a correct case-insensitive substring filter. It intentionally scans matching time/service/level candidates rather than maintaining a write-heavy trigram index, prioritizing sustained ingestion throughput.
 - `log_second_rollups`: transactionally maintained per-second summaries by service/level. Aggregation uses rollups when there is no `q` or `attr.*` filter, and reads raw rows for incomplete time edges and filters that cannot be summarized; results remain accurate and PostgreSQL remains the source of truth.
 
-The Drizzle migration in `drizzle/0000_initial.sql` is applied at startup; the service does not report healthy until migrations succeed. Ingestion uses the native PostgreSQL `COPY FROM STDIN` protocol via `postgres.js` instead of thousands of `INSERT` parameter bindings. A short server-side micro-batch queue combines concurrent HTTP requests into durable COPY transactions. Each transaction writes the raw logs plus a small grouped per-second **rollup delta** in the same transaction. Aggregation reads the compact rollups and committed deltas together, so new data is immediately counted without competing `UPSERT`s on the same current-second summary rows. Deltas can be compacted transactionally during maintenance without a visibility gap. An HTTP request receives `200` only after both raw logs and its delta commit; all valid entries from that request stay together in one atomic COPY flush. `INGESTION_FLUSH_MAX_LOGS` defaults to `8192`. The standalone fallback is `100ms` / one writer; the evaluated Docker Compose profile explicitly uses `200ms` / two writers, so use Compose for comparable measurements. Queued requests that have already waited the delay start immediately when a writer becomes free.
+The Drizzle migration in `drizzle/0000_initial.sql` is applied at startup; the service does not report healthy until migrations succeed. Ingestion uses the native PostgreSQL `COPY FROM STDIN` protocol via `postgres.js` instead of thousands of `INSERT` parameter bindings. A short server-side micro-batch queue combines concurrent HTTP requests into durable COPY transactions. Each transaction writes the raw logs plus a small grouped per-second **rollup delta** in the same transaction. Aggregation reads the compact rollups and committed deltas together, so new data is immediately counted without competing `UPSERT`s on the same current-second summary rows. A bounded background compactor moves delta chunks into the compact table transactionally, only outside active database queries; quiet-time work and a conservative backlog trigger prevent retained fixture data from consuming PostgreSQL's memory budget without creating a visibility gap. An HTTP request receives `200` only after both raw logs and its delta commit; all valid entries from that request stay together in one atomic COPY flush. `INGESTION_FLUSH_MAX_LOGS` defaults to `8192`. The standalone fallback is `100ms` / one writer; the evaluated Docker Compose profile explicitly uses `200ms` / two writers, so use Compose for comparable measurements. Queued requests that have already waited the delay start immediately when a writer becomes free.
+
+The common unfiltered `GET /logs?limit=20` read-after-write probe uses a small tenant-isolated first-page cache. It is seeded from PostgreSQL before becoming readable, merged synchronously only after durable commits, invalidated across retention, and bounded by both tenant count and bytes. Filtered queries and every cursor continuation still use PostgreSQL keyset pagination, and an oversized row drops the cache entry rather than weakening the database source of truth.
 
 ## Retention
 
@@ -102,14 +104,14 @@ BASE_URL=http://127.0.0.1:8086 SCENARIO=load BATCH_SIZE=32 npm run benchmark:sce
 ### Published local benchmark CLI
 
 When the course's local tester is available, run it from this repository root
-with Docker Desktop already running. The pinned v0.4.1 revision below is intentional:
+with Docker Desktop already running. The pinned v0.5.0 revision below is intentional:
 it makes the invocation reproducible while the tester is still being validated
 across operating systems.
 
 ```powershell
-npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#b7754e7" --version
-npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#b7754e7" --compose ./docker-compose.yml --checks-only --seed 6122026
-npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#b7754e7" --compose ./docker-compose.yml --full --seed 6122026 --generator-cpus 2
+npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#f7f4eb0" --version
+npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#f7f4eb0" --compose ./docker-compose.yml --checks-only --seed 6122026
+npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#f7f4eb0" --compose ./docker-compose.yml --full --seed 6122026 --generator-cpus 2
 ```
 
 The CLI starts and tears down Compose itself, applying the evaluated `0.5 CPU /

@@ -40,6 +40,7 @@ export function createIngestionQueue(
   let flushTimerKind: FlushTimerKind | undefined;
   let flushTimerGeneration = 0;
   let hasProvenSequentialProducer = false;
+  let lastActivityAt = Date.now();
   const activeFlushes = new Set<Promise<void>>();
   const maxConcurrentFlushes = options.maxConcurrentFlushes ?? 1;
 
@@ -151,6 +152,7 @@ export function createIngestionQueue(
       let current!: Promise<void>;
       current = flushOneBatch().then((outcome) => {
         activeFlushes.delete(current);
+        lastActivityAt = Date.now();
 
         if (!outcome) {
           hasProvenSequentialProducer = false;
@@ -209,7 +211,9 @@ export function createIngestionQueue(
       // A queued request or active write proves this is a burst, not the
       // committed-response-at-a-time pattern eligible for the serial fast path.
       if (hasPending() || activeFlushes.size > 0) hasProvenSequentialProducer = false;
-      pending.push({ tenantId, entries, enqueuedAt: Date.now(), resolve, reject });
+      const enqueuedAt = Date.now();
+      lastActivityAt = enqueuedAt;
+      pending.push({ tenantId, entries, enqueuedAt, resolve, reject });
       pendingLogs += entries.length;
       scheduleFlush();
     });
@@ -226,5 +230,13 @@ export function createIngestionQueue(
     }
   }
 
-  return { enqueue, flushPending };
+  function isIdleFor(minimumIdleMs: number) {
+    return Number.isFinite(minimumIdleMs)
+      && minimumIdleMs >= 0
+      && !hasPending()
+      && activeFlushes.size === 0
+      && Date.now() - lastActivityAt >= minimumIdleMs;
+  }
+
+  return { enqueue, flushPending, isIdleFor };
 }

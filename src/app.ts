@@ -9,6 +9,7 @@ import { addTail, metrics, publishTail, recordIngestion, recordRequest } from ".
 import { allowRequest, beginIngestion, endIngestion, persistDeadLetters } from "./services/ingestion-controls.js";
 import { notifyErrorThreshold } from "./services/alerts.js";
 import { enqueueIngestion } from "./services/ingestion-batcher.js";
+import { beginDatabaseQueryActivity } from "./services/database-activity.js";
 
 export const app = express();
 const defaultPrincipal: Principal = { tenantId: "default", scopes: ["ingest", "query"], seeded: false };
@@ -136,7 +137,8 @@ app.get("/logs", async (req, res, next) => {
     const query = parseLogsQuery(req.query);
     const principal = principalFor(res);
     if (!principal.scopes.includes("query")) return res.status(403).json({ error: "credential lacks query permission" });
-    const result = await getLogs(query, principal.tenantId);
+    const finishQuery = beginDatabaseQueryActivity();
+    const result = await getLogs(query, principal.tenantId).finally(finishQuery);
     return res.status(200).json({ logs: result.logs, next_cursor: result.nextCursor });
   } catch (error) {
     return next(error);
@@ -148,7 +150,8 @@ app.get("/logs/aggregate", async (req, res, next) => {
     const query = parseAggregateQuery(req.query);
     const principal = principalFor(res);
     if (!principal.scopes.includes("query")) return res.status(403).json({ error: "credential lacks query permission" });
-    const buckets = await getAggregate(query, principal.tenantId);
+    const finishQuery = beginDatabaseQueryActivity();
+    const buckets = await getAggregate(query, principal.tenantId).finally(finishQuery);
     return res.status(200).json({ buckets });
   } catch (error) {
     return next(error);

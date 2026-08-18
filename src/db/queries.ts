@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, gte, inArray, lt, lte, or, sql, type SQL } from "drizzle-orm";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { randomUUID } from "node:crypto";
+import { randomFillSync } from "node:crypto";
 import type postgres from "postgres";
 import { encodeCursor, type CursorFilterContext, type DecodedCursor } from "../cursor.js";
 import type { AggregateQuery, LogQuery } from "../validation.js";
@@ -15,6 +15,12 @@ import {
   type PackedLogIds,
   type QueryPageSession,
 } from "../services/query-page-sessions.js";
+import {
+  invalidateCachedRecentLogs,
+  loadCachedRecentLogs,
+  recordCachedRecentLogs,
+  type RecentLogRow,
+} from "../services/recent-log-cache.js";
 
 export type LogWrite = { entry: NewLog; tenantId: string };
 
@@ -40,12 +46,38 @@ const ROLLUP_MAINTENANCE_LOCK = 78_123_457;
 // row uses five values, so leave ample room below that limit for an oversized
 // but otherwise valid HTTP request.
 const ROLLUP_UPSERT_MAX_ROWS = 10_000;
-const ROLLUP_DELTA_DRAIN_ROWS = 10_000;
+const ROLLUP_DELTA_DRAIN_ROWS = 50_000;
+const RECENT_LOG_CACHE_ROWS = 21;
+const UUID_V7_RANDOM_BYTES = 10;
+const HEX_NIBBLES = "0123456789abcdef";
+const BYTE_HEX = Array.from({ length: 256 }, (_, value) => value.toString(16).padStart(2, "0"));
+let estimatedRollupDeltaRows = 0;
+let rollupDeltaGeneration = 0;
 type TransactionSql = postgres.TransactionSql;
-type StoredRollupDelta = Omit<RollupWrite, "bucket_start" | "count"> & {
-  bucket_start: Date | string;
-  count: number | string;
-};
+
+type RecentLogCandidate = { entry: NewLog; id: string; milliseconds: number };
+
+function newestRecentCandidateFirst(left: RecentLogCandidate, right: RecentLogCandidate) {
+  const timestampOrder = right.milliseconds - left.milliseconds;
+  if (timestampOrder !== 0) return timestampOrder;
+  return left.id === right.id ? 0 : left.id < right.id ? 1 : -1;
+}
+
+function considerRecentRow(rows: RecentLogCandidate[], entry: NewLog, id: string, milliseconds: number) {
+  const tail = rows[rows.length - 1];
+  if (rows.length >= RECENT_LOG_CACHE_ROWS && tail) {
+    const timestampOrder = tail.milliseconds - milliseconds;
+    const order = timestampOrder !== 0 ? timestampOrder : id === tail.id ? 0 : id < tail.id ? 1 : -1;
+    if (order >= 0) return;
+  }
+  const candidate = { entry, id, milliseconds };
+  let insertionIndex = rows.length;
+  while (insertionIndex > 0 && newestRecentCandidateFirst(candidate, rows[insertionIndex - 1]!) < 0) {
+    insertionIndex -= 1;
+  }
+  rows.splice(insertionIndex, 0, candidate);
+  if (rows.length > RECENT_LOG_CACHE_ROWS) rows.pop();
+}
 
 export async function insertLogs(entries: NewLog[], tenantId = "default") {
   await insertLogWrites(entries.map((entry) => ({ entry, tenantId })));
@@ -58,7 +90,10 @@ export async function insertLogWrites(entries: LogWrite[]) {
   // three full-size intermediate arrays for every durable micro-batch.
   const copyRows = new Array<string>(entries.length);
   const rollupGroups = new Map<string, RollupWrite>();
-  const timestampTexts = new Map<number, { timestamp: string; bucketStart: string }>();
+  const timestampTexts = new Map<number, { timestamp: string; bucketStart: string; uuidPrefix: string }>();
+  const recentRowsByTenant = new Map<string, RecentLogCandidate[]>();
+  const uuidRandomBytes = Buffer.allocUnsafe(entries.length * UUID_V7_RANDOM_BYTES);
+  randomFillSync(uuidRandomBytes);
 
   for (let index = 0; index < entries.length; index += 1) {
     const { entry, tenantId } = entries[index];
@@ -69,15 +104,26 @@ export async function insertLogWrites(entries: LogWrite[]) {
     let timestampText = timestampTexts.get(milliseconds);
     if (!timestampText) {
       const text = timestamp.toISOString();
-      timestampText = { timestamp: text, bucketStart: `${text.slice(0, 19)}.000Z` };
+      timestampText = {
+        timestamp: text,
+        bucketStart: `${text.slice(0, 19)}.000Z`,
+        uuidPrefix: uuidV7TimestampPrefix(milliseconds),
+      };
       timestampTexts.set(milliseconds, timestampText);
     }
-    const id = uuidV7(milliseconds);
+    const id = uuidV7FromPrefix(timestampText.uuidPrefix, uuidRandomBytes, index * UUID_V7_RANDOM_BYTES);
     const attributes = JSON.stringify(entry.attributes ?? {});
     // id, timestamp, and level are generated/validated protocol values and
     // cannot contain COPY control characters. The remaining user or tenant
     // fields still take the escaping path.
     copyRows[index] = `${id}\t${timestampText.timestamp}\t${entry.level}\t${escapeCopyField(entry.service)}\t${escapeCopyField(entry.message)}\t${escapeCopyField(attributes)}\t${escapeCopyField(tenantId)}\n`;
+
+    let recentRows = recentRowsByTenant.get(tenantId);
+    if (!recentRows) {
+      recentRows = [];
+      recentRowsByTenant.set(tenantId, recentRows);
+    }
+    considerRecentRow(recentRows, entry, id, milliseconds);
 
     // NUL is rejected for user text and PostgreSQL cannot store it in a text
     // tenant ID, so it is a collision-free separator without per-row JSON
@@ -98,12 +144,10 @@ export async function insertLogWrites(entries: LogWrite[]) {
   }
 
   const copyRowsText = copyRows.join("");
-  const rollups = [...rollupGroups.values()].sort((left, right) =>
-    left.tenant_id.localeCompare(right.tenant_id)
-    || left.bucket_start.localeCompare(right.bucket_start)
-    || left.service.localeCompare(right.service)
-    || left.level.localeCompare(right.level),
-  );
+  // Deltas have no conflict key, so their insertion order cannot deadlock and
+  // does not affect aggregate semantics. Avoid sorting every write batch; the
+  // compactor performs its grouped UPSERT later in one PostgreSQL statement.
+  const rollups = [...rollupGroups.values()];
 
   await client.begin(async (transaction) => {
     const copyStream = await transaction`
@@ -118,6 +162,23 @@ export async function insertLogWrites(entries: LogWrite[]) {
     await transaction`SELECT pg_advisory_xact_lock_shared(${ROLLUP_MAINTENANCE_LOCK}::bigint)`;
     await appendRollupDeltas(transaction, rollups);
   });
+  // This is an intentionally conservative process-local estimate used only to
+  // trigger bounded maintenance. A compaction racing this increment can make
+  // it high, never dangerously low; an extra empty chunk is harmless.
+  estimatedRollupDeltaRows += rollups.length;
+  rollupDeltaGeneration += 1;
+  for (const [tenantId, candidates] of recentRowsByTenant) {
+    // The transaction has committed, and this synchronous merge happens before
+    // the queue resolves the POST. A subsequent read therefore sees its write.
+    recordCachedRecentLogs(tenantId, candidates.map(({ entry, id, milliseconds }) => ({
+      id,
+      timestamp: new Date(milliseconds),
+      level: entry.level,
+      service: entry.service,
+      message: entry.message,
+      attributes: entry.attributes ?? {},
+    })));
+  }
 }
 
 async function appendRollupDeltas(transaction: TransactionSql, rollups: RollupWrite[]) {
@@ -129,46 +190,67 @@ async function appendRollupDeltas(transaction: TransactionSql, rollups: RollupWr
   }
 }
 
-async function upsertRollups(transaction: TransactionSql, rollups: RollupWrite[]) {
-  for (let offset = 0; offset < rollups.length; offset += ROLLUP_UPSERT_MAX_ROWS) {
-    const chunk = rollups.slice(offset, offset + ROLLUP_UPSERT_MAX_ROWS);
-    await transaction`
-      INSERT INTO log_second_rollups ${transaction(chunk, ["tenant_id", "bucket_start", "service", "level", "count"])}
+async function compactOneRollupDeltaChunk(transaction: TransactionSql) {
+  // Keep the claimed rows and their grouped UPSERT inside PostgreSQL. The old
+  // path returned 10k rows to the half-core Node process, rebuilt a Map, then
+  // sent the same data back as another statement. A writable CTE preserves the
+  // exact transactional visibility while making quiet-time maintenance cheap.
+  const result = await transaction<Array<{ claimed_count: number | string }>>`
+    WITH claimed AS MATERIALIZED (
+      DELETE FROM log_second_rollup_deltas
+      WHERE id IN (
+        SELECT id FROM log_second_rollup_deltas
+        ORDER BY id
+        LIMIT ${ROLLUP_DELTA_DRAIN_ROWS}
+        FOR UPDATE SKIP LOCKED
+      )
+      RETURNING tenant_id, bucket_start, service, level, count
+    ), merged AS MATERIALIZED (
+      SELECT tenant_id, bucket_start, service, level, sum(count)::bigint AS count
+      FROM claimed
+      GROUP BY tenant_id, bucket_start, service, level
+    ), upserted AS (
+      INSERT INTO log_second_rollups (tenant_id, bucket_start, service, level, count)
+      SELECT tenant_id, bucket_start, service, level, count
+      FROM merged
       ON CONFLICT (tenant_id, bucket_start, service, level)
       DO UPDATE SET count = log_second_rollups.count + EXCLUDED.count
-    `;
-  }
+      RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM claimed)::integer AS claimed_count,
+           (SELECT count(*) FROM upserted)::integer AS upserted_count
+  `;
+  const claimedCount = Number(result[0]?.claimed_count ?? 0);
+  return claimedCount;
 }
 
-async function compactOneRollupDeltaChunk(transaction: TransactionSql) {
-  const rows = await transaction<StoredRollupDelta[]>`
-    DELETE FROM log_second_rollup_deltas
-    WHERE id IN (
-      SELECT id FROM log_second_rollup_deltas
-      ORDER BY id
-      LIMIT ${ROLLUP_DELTA_DRAIN_ROWS}
-      FOR UPDATE SKIP LOCKED
-    )
-    RETURNING tenant_id, bucket_start, service, level, count
-  `;
-  if (rows.length === 0) return false;
-  const rollups = mergeRollupWrites(rows.map((row) => ({
-    ...row,
-    bucket_start: row.bucket_start instanceof Date ? row.bucket_start.toISOString() : row.bucket_start,
-    count: Number(row.count),
-  })));
-  await upsertRollups(transaction, rollups);
-  return rows.length === ROLLUP_DELTA_DRAIN_ROWS;
+/** Compact one bounded delta chunk; returns true while another chunk may exist. */
+export async function compactRollupDeltaChunk() {
+  const generationBeforeCompaction = rollupDeltaGeneration;
+  const claimedCount = await client.begin(async (transaction) => {
+    await transaction`SELECT pg_advisory_xact_lock_shared(${ROLLUP_MAINTENANCE_LOCK}::bigint)`;
+    return compactOneRollupDeltaChunk(transaction);
+  });
+  if (claimedCount > 0) {
+    estimatedRollupDeltaRows = Math.max(0, estimatedRollupDeltaRows - claimedCount);
+  } else if (rollupDeltaGeneration === generationBeforeCompaction) {
+    // A writer may commit after the empty DELETE snapshot because both normal
+    // ingestion and compaction deliberately use the shared maintenance lock.
+    // Never erase that writer's fresh trigger signal.
+    estimatedRollupDeltaRows = 0;
+  }
+  return claimedCount === ROLLUP_DELTA_DRAIN_ROWS;
+}
+
+export function hasRollupDeltaBacklog(minimumRows = 100_000) {
+  return estimatedRollupDeltaRows >= minimumRows;
 }
 
 /** Move all accumulated deltas into the compact rollup table without a visibility gap. */
 export async function flushRollupDeltas() {
   let hasMore = true;
   while (hasMore) {
-    hasMore = await client.begin(async (transaction) => {
-      await transaction`SELECT pg_advisory_xact_lock_shared(${ROLLUP_MAINTENANCE_LOCK}::bigint)`;
-      return compactOneRollupDeltaChunk(transaction);
-    });
+    hasMore = await compactRollupDeltaChunk();
   }
 }
 
@@ -201,12 +283,32 @@ function prepareLogWrite(write: LogWrite): PreparedLogWrite {
 // inserts across every UUID B-tree page. UUIDv7 preserves the UUID API while
 // making IDs generated for current logs append-friendly in the primary and
 // timestamp/id indexes.
+function uuidV7TimestampPrefix(milliseconds: number) {
+  // UUIDv7 carries an unsigned 48-bit Unix millisecond field, while the API
+  // intentionally accepts valid historical ISO timestamps before 1970. Clamp
+  // only the UUID component; logs.timestamp remains the ordering authority.
+  const uuidMilliseconds = Math.max(0, Math.min(0xffffffffffff, Math.floor(milliseconds)));
+  const timestamp = uuidMilliseconds.toString(16).padStart(12, "0");
+  return `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7`;
+}
+
+function uuidV7FromPrefix(prefix: string, bytes: Uint8Array, offset: number) {
+  return `${prefix}${HEX_NIBBLES[bytes[offset]! & 0x0f]}${BYTE_HEX[bytes[offset + 1]!]}`
+    + `-${BYTE_HEX[0x80 | (bytes[offset + 2]! & 0x3f)]}${BYTE_HEX[bytes[offset + 3]!]}`
+    + `-${BYTE_HEX[bytes[offset + 4]!]}${BYTE_HEX[bytes[offset + 5]!]}`
+    + `${BYTE_HEX[bytes[offset + 6]!]}${BYTE_HEX[bytes[offset + 7]!]}`
+    + `${BYTE_HEX[bytes[offset + 8]!]}${BYTE_HEX[bytes[offset + 9]!]}`;
+}
+
+/** Deterministic test seam for verifying the UUIDv7 random-bit mapping. */
+export function uuidV7FromRandomBytes(milliseconds: number, bytes: Uint8Array, offset = 0) {
+  return uuidV7FromPrefix(uuidV7TimestampPrefix(milliseconds), bytes, offset);
+}
+
 export function uuidV7(milliseconds: number) {
-  const timestamp = Math.floor(milliseconds).toString(16).padStart(12, "0").slice(-12);
-  const random = randomUUID();
-  const variant = (8 | (Number.parseInt(random[3], 16) & 0x3)).toString(16);
-  const tail = random[7] + random.slice(9, 13) + random.slice(14, 18) + random.slice(19, 22);
-  return `${timestamp.slice(0, 8)}-${timestamp.slice(8)}-7${random.slice(0, 3)}-${variant}${random.slice(4, 7)}-${tail}`;
+  const bytes = Buffer.allocUnsafe(UUID_V7_RANDOM_BYTES);
+  randomFillSync(bytes);
+  return uuidV7FromPrefix(uuidV7TimestampPrefix(milliseconds), bytes, 0);
 }
 
 function rollupWrites(entries: PreparedLogWrite[]): RollupWrite[] {
@@ -359,6 +461,17 @@ function publicLogProjection() {
     message: logs.message,
     attributes: logs.attributes,
   };
+}
+
+function isRecentLogCacheQuery(params: LogQuery) {
+  return params.limit === 20
+    && !params.cursor
+    && !params.level
+    && !params.service
+    && !params.since
+    && !params.until
+    && params.q === undefined
+    && Object.keys(params.attributes).length === 0;
 }
 
 function pageResult<T extends { id: string; timestamp: Date }>(
@@ -791,6 +904,15 @@ queryPageSessionCleanup.unref();
 
 export async function getLogs(params: LogQuery, tenantId = "default") {
   const filterContext = filterContextFromParams(params);
+  if (isRecentLogCacheQuery(params)) {
+    const recentRows = await loadCachedRecentLogs(tenantId, () => (
+      db.select(publicLogProjection()).from(logs)
+        .where(eq(logs.tenantId, tenantId))
+        .orderBy(desc(logs.timestamp), desc(logs.id))
+        .limit(RECENT_LOG_CACHE_ROWS)
+    ));
+    return pageResult([...recentRows], params.limit, filterContext);
+  }
   const baseConditions = filterConditions(params);
   baseConditions.push(eq(logs.tenantId, tenantId));
   const conditions = [...baseConditions];
@@ -1097,14 +1219,31 @@ export async function getAggregate(params: AggregateQuery, tenantId = "default")
 }
 
 export async function deleteExpiredLogs(cutoff: Date) {
-  return client.begin(async (transaction) => {
-    // Make every delta visible in the compact rollups before the delete trigger
-    // subtracts expired rows. New ingestions hold the shared version of this
-    // advisory lock until their raw rows and deltas commit.
-    await transaction`SELECT pg_advisory_xact_lock(${ROLLUP_MAINTENANCE_LOCK}::bigint)`;
-    let hasMore = true;
-    while (hasMore) hasMore = await compactOneRollupDeltaChunk(transaction);
-    const deleted = await transaction`DELETE FROM logs WHERE timestamp < ${cutoff.toISOString()}::timestamptz`;
-    return deleted.count;
-  });
+  // Invalidate both sides of retention. A first-page seed whose PostgreSQL
+  // snapshot predates the delete must fail its Loading identity check and can
+  // never reinstall rows removed by the completed transaction.
+  invalidateCachedRecentLogs();
+  const generationBeforeRetention = rollupDeltaGeneration;
+  try {
+    const deleted = await client.begin(async (transaction) => {
+      // Make every delta visible in the compact rollups before the delete trigger
+      // subtracts expired rows. New ingestions hold the shared version of this
+      // advisory lock until their raw rows and deltas commit.
+      await transaction`SELECT pg_advisory_xact_lock(${ROLLUP_MAINTENANCE_LOCK}::bigint)`;
+      let claimedCount = ROLLUP_DELTA_DRAIN_ROWS;
+      while (claimedCount === ROLLUP_DELTA_DRAIN_ROWS) {
+        claimedCount = await compactOneRollupDeltaChunk(transaction);
+      }
+      const removed = await transaction`DELETE FROM logs WHERE timestamp < ${cutoff.toISOString()}::timestamptz`;
+      return removed.count;
+    });
+    // Reset only after COMMIT, and only if no writer committed while retention
+    // was acquiring/releasing its exclusive lock. A changed generation leaves
+    // a harmless overestimate that the next bounded chunk corrects; it can
+    // never hide a real fresh backlog.
+    if (rollupDeltaGeneration === generationBeforeRetention) estimatedRollupDeltaRows = 0;
+    return deleted;
+  } finally {
+    invalidateCachedRecentLogs();
+  }
 }
