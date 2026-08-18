@@ -67,6 +67,46 @@ test("flushes a lone request before the high-throughput batching deadline", asyn
   await accepted;
 });
 
+test("accelerates a producer proven to send requests sequentially", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  let invocations = 0;
+  const queue = createIngestionQueue(async () => {
+    invocations += 1;
+  }, { maxLogs: 100, maxDelayMs: 500 });
+
+  const first = queue.enqueue("default", [log("first")]);
+  t.mock.timers.tick(19);
+  assert.equal(invocations, 0);
+  t.mock.timers.tick(1);
+  await first;
+
+  const second = queue.enqueue("default", [log("second")]);
+  t.mock.timers.tick(1);
+  await second;
+  assert.equal(invocations, 2);
+});
+
+test("returns a proven serial producer to normal batching when a request joins it", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const batches: string[][] = [];
+  const queue = createIngestionQueue(async (batch) => {
+    batches.push(batch.map(({ entry }) => entry.message));
+  }, { maxLogs: 100, maxDelayMs: 500 });
+
+  const warmup = queue.enqueue("default", [log("warmup")]);
+  t.mock.timers.tick(20);
+  await warmup;
+
+  const first = queue.enqueue("default", [log("one")]);
+  const second = queue.enqueue("default", [log("two")]);
+  t.mock.timers.tick(499);
+  assert.deepEqual(batches, [["warmup"]]);
+
+  t.mock.timers.tick(1);
+  await Promise.all([first, second]);
+  assert.deepEqual(batches, [["warmup"], ["one", "two"]]);
+});
+
 test("restores normal batching when another request joins a sparse request", async () => {
   const batches: string[][] = [];
   const queue = createIngestionQueue(async (batch) => {

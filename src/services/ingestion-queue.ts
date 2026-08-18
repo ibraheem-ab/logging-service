@@ -9,6 +9,10 @@ type PendingIngestion = {
   reject: (error: unknown) => void;
 };
 
+type FlushOutcome =
+  | { ok: true; batch: PendingIngestion[]; wasIsolated: boolean }
+  | { ok: false; batch: PendingIngestion[]; error: unknown };
+
 export type IngestionWriter = (writes: LogWrite[]) => Promise<void>;
 export type IngestionQueueOptions = {
   maxLogs: number;
@@ -21,6 +25,7 @@ export type IngestionQueueOptions = {
 // second request time to join, while sustained traffic continues to use the
 // configured maxDelayMs window.
 const SPARSE_REQUEST_FLUSH_MAX_DELAY_MS = 20;
+const PROVEN_SERIAL_REQUEST_FLUSH_MAX_DELAY_MS = 1;
 type FlushTimerKind = "normal" | "sparse";
 
 export function createIngestionQueue(
@@ -34,6 +39,7 @@ export function createIngestionQueue(
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
   let flushTimerKind: FlushTimerKind | undefined;
   let flushTimerGeneration = 0;
+  let hasProvenSequentialProducer = false;
   const activeFlushes = new Set<Promise<void>>();
   const maxConcurrentFlushes = options.maxConcurrentFlushes ?? 1;
 
@@ -90,6 +96,12 @@ export function createIngestionQueue(
     return pendingRequestCount() === 1 && activeFlushes.size === 0;
   }
 
+  function sparseFlushDelayMs() {
+    return hasProvenSequentialProducer
+      ? PROVEN_SERIAL_REQUEST_FLUSH_MAX_DELAY_MS
+      : SPARSE_REQUEST_FLUSH_MAX_DELAY_MS;
+  }
+
   function armFlushTimer(kind: FlushTimerKind, delayMs: number) {
     clearFlushTimer();
     const generation = ++flushTimerGeneration;
@@ -110,9 +122,10 @@ export function createIngestionQueue(
     }, delayMs);
   }
 
-  async function flushOneBatch() {
+  async function flushOneBatch(): Promise<FlushOutcome | undefined> {
     const batch = takeFlushBatch();
     if (batch.length === 0) return;
+    const wasIsolated = batch.length === 1 && activeFlushes.size === 0 && !hasPending();
     const writes: LogWrite[] = [];
     for (const request of batch) {
       for (const entry of request.entries) writes.push({ entry, tenantId: request.tenantId });
@@ -120,10 +133,9 @@ export function createIngestionQueue(
 
     try {
       await writer(writes);
-      for (const request of batch) request.resolve();
+      return { ok: true, batch, wasIsolated };
     } catch (error) {
-      onFlushError(error);
-      for (const request of batch) request.reject(error);
+      return { ok: false, batch, error };
     }
   }
 
@@ -137,8 +149,25 @@ export function createIngestionQueue(
       && (force || shouldFlush())
     ) {
       let current!: Promise<void>;
-      current = flushOneBatch().finally(() => {
+      current = flushOneBatch().then((outcome) => {
         activeFlushes.delete(current);
+
+        if (!outcome) {
+          hasProvenSequentialProducer = false;
+        } else if (outcome.ok) {
+          // A serial producer waits for the committed response before sending
+          // its next request. After proving that pattern, use a near-immediate
+          // timer for its next singleton without reducing burst coalescing.
+          hasProvenSequentialProducer = outcome.wasIsolated
+            && !hasPending()
+            && activeFlushes.size === 0;
+          for (const request of outcome.batch) request.resolve();
+        } else {
+          hasProvenSequentialProducer = false;
+          onFlushError(outcome.error);
+          for (const request of outcome.batch) request.reject(outcome.error);
+        }
+
         if (hasPending()) scheduleFlush();
       });
       activeFlushes.add(current);
@@ -164,7 +193,7 @@ export function createIngestionQueue(
 
       const remainingDelayMs = Math.max(0, options.maxDelayMs - oldestPendingAgeMs());
       const delayMs = kind === "sparse"
-        ? Math.min(SPARSE_REQUEST_FLUSH_MAX_DELAY_MS, remainingDelayMs)
+        ? Math.min(sparseFlushDelayMs(), remainingDelayMs)
         : remainingDelayMs;
       armFlushTimer(kind, delayMs);
     }
@@ -177,6 +206,9 @@ export function createIngestionQueue(
  */
   function enqueue(tenantId: string, entries: NewLog[]) {
     return new Promise<void>((resolve, reject) => {
+      // A queued request or active write proves this is a burst, not the
+      // committed-response-at-a-time pattern eligible for the serial fast path.
+      if (hasPending() || activeFlushes.size > 0) hasProvenSequentialProducer = false;
       pending.push({ tenantId, entries, enqueuedAt: Date.now(), resolve, reject });
       pendingLogs += entries.length;
       scheduleFlush();
