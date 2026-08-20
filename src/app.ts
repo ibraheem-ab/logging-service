@@ -10,6 +10,7 @@ import { allowRequest, beginIngestion, endIngestion, persistDeadLetters } from "
 import { notifyErrorThreshold } from "./services/alerts.js";
 import { enqueueIngestion } from "./services/ingestion-batcher.js";
 import { beginDatabaseQueryActivity } from "./services/database-activity.js";
+import { dashboardHtml } from "./dashboard.js";
 
 export const app = express();
 const defaultPrincipal: Principal = { tenantId: "default", scopes: ["ingest", "query"], seeded: false };
@@ -40,6 +41,13 @@ app.get("/health", (_req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
+// The dashboard shell contains no tenant data. Keeping it public lets an
+// operator enter a bearer key in the UI when optional authentication is on;
+// every data request made by the shell still passes through authentication.
+app.get("/dashboard", (_req, res) => {
+  res.type("html").send(dashboardHtml);
+});
+
 if (config.authEnabled) {
   app.use(async (req, res, next) => {
     if (req.path === "/health") return next();
@@ -60,10 +68,6 @@ if (config.authEnabled) {
 app.get("/metrics", (_req, res) => {
   if (!config.metricsEnabled) return res.status(404).json({ error: "metrics disabled" });
   res.type("text/plain; version=0.0.4").send(metrics());
-});
-
-app.get("/dashboard", (_req, res) => {
-  res.type("html").send(`<!doctype html><title>Log Service</title><main><h1>Log Service Dashboard</h1><form id=f><input name=service placeholder=service><select name=level><option value="">all levels</option><option>debug</option><option>info</option><option>warn</option><option>error</option></select><input name=q placeholder="message search"><button>Search</button></form><pre id=logs>Submit a search.</pre><h2>Metrics</h2><pre id=m>Loading…</pre><script>const out=document.querySelector('#logs');document.querySelector('#f').onsubmit=async e=>{e.preventDefault();const p=new URLSearchParams(new FormData(e.target));for(const[k,v]of [...p])if(!v)p.delete(k);out.textContent=JSON.stringify(await fetch('/logs?'+p).then(r=>r.json()),null,2)};fetch('/metrics').then(r=>r.text()).then(t=>m.textContent=t)</script></main>`);
 });
 
 function principalFor(res: Response): Principal {

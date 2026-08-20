@@ -204,11 +204,11 @@ The project includes `smoke:test` for the API contract and `load:test` for perfo
 
 All of the following are additive and do not change the shape or success semantics of the required endpoints when running `docker compose up` with no configuration:
 
-- **Authentication and multi-tenancy**: disabled by default via `AUTH_ENABLED=false`. When `AUTH_ENABLED=true` and `LOADGEN_API_KEY=<key>` are set, the key is seeded automatically at startup with ingest/query scopes under tenant `loadgen`. Supports `Authorization: Bearer <key>` and `X-API-Key`; `/health` remains public; authentication protects all other routes.
+- **Authentication and multi-tenancy**: disabled by default via `AUTH_ENABLED=false`. When `AUTH_ENABLED=true` and `LOADGEN_API_KEY=<key>` are set, the key is seeded automatically at startup with ingest/query scopes under tenant `loadgen`. Supports `Authorization: Bearer <key>` and `X-API-Key`; `/health` and the static `/dashboard` shell remain public, while every data/API request from the dashboard and all required API routes stay protected.
 - **Rate limiting**: disabled via `RATE_LIMIT_ENABLED=false`. Enable with `RATE_LIMIT_REQUESTS` (default 1000 requests/minute); the seeded load generator key is exempt.
 - **Backpressure**: disabled via `BACKPRESSURE_ENABLED=false`. When enabled, caps concurrent ingestions with `MAX_CONCURRENT_INGESTIONS` (default 16) and responds with `503` and `Retry-After` instead of dropping logs silently.
 - **Dead letters**: disabled via `DEAD_LETTER_ENABLED=false`. When enabled, rejected entries and their reasons are stored in `dead_letters` without changing the `POST /logs` response shape.
-- **Metrics and dashboard**: `/metrics` exposes Prometheus counters when `METRICS_ENABLED=true` (default false); `/dashboard` serves a lightweight operations UI.
+- **Metrics and dashboard**: `/metrics` exposes Prometheus counters when `METRICS_ENABLED=true` (default false); `/dashboard` serves a lightweight operations UI and can hold an optional bearer key in tab-scoped session storage for authenticated deployments.
 - **Live tail**: `/logs/tail` is an SSE stream of recently accepted logs; disabled via `LIVE_TAIL_ENABLED=false`.
 - **Alert webhook**: disabled via `ALERTS_ENABLED=false`. Requires `ALERT_WEBHOOK_URL` and fires when a batch contains at least `ALERT_ERROR_THRESHOLD` error-level logs (default 1).
 - **Custom query language**: use the additional `query` parameter, e.g. `query=service:checkout level:error attr.region:eu q:declined` on `/logs` or `/logs/aggregate`; standard query parameters remain fully supported.
