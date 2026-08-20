@@ -19,3 +19,4 @@ Thumbs.db
 
 # Generated temporarily by the official local benchmark CLI.
 .load-generator.compose.override.yml
+benchmark-report*.json

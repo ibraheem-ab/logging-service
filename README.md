@@ -81,7 +81,7 @@ The `logs` table uses UUID primary keys, `timestamptz`, text columns for level/s
 - `q` remains a correct case-insensitive substring filter. It intentionally scans matching time/service/level candidates rather than maintaining a write-heavy trigram index, prioritizing sustained ingestion throughput.
 - `log_second_rollups`: transactionally maintained per-second summaries by service/level. Aggregation uses rollups when there is no `q` or `attr.*` filter, and reads raw rows for incomplete time edges and filters that cannot be summarized; results remain accurate and PostgreSQL remains the source of truth.
 
-The Drizzle migration in `drizzle/0000_initial.sql` is applied at startup; the service does not report healthy until migrations succeed. Ingestion uses the native PostgreSQL `COPY FROM STDIN` protocol via `postgres.js` instead of thousands of `INSERT` parameter bindings. A short server-side micro-batch queue combines concurrent HTTP requests into durable COPY transactions. Each transaction writes the raw logs plus a small grouped per-second **rollup delta** in the same transaction. Aggregation reads the compact rollups and committed deltas together, so new data is immediately counted without competing `UPSERT`s on the same current-second summary rows. A bounded background compactor moves delta chunks into the compact table transactionally, only outside active database queries; quiet-time work and a conservative backlog trigger prevent retained fixture data from consuming PostgreSQL's memory budget without creating a visibility gap. An HTTP request receives `200` only after both raw logs and its delta commit; all valid entries from that request stay together in one atomic COPY flush. `INGESTION_FLUSH_MAX_LOGS` defaults to `8192`. The standalone fallback is `100ms` / one writer; the evaluated Docker Compose profile explicitly uses `200ms` / two writers, so use Compose for comparable measurements. Queued requests that have already waited the delay start immediately when a writer becomes free.
+The Drizzle migration set under `drizzle/` is applied at startup; the service does not report healthy until every migration succeeds. Ingestion uses the native PostgreSQL `COPY FROM STDIN` protocol via `postgres.js` instead of thousands of `INSERT` parameter bindings. A short server-side micro-batch queue combines concurrent HTTP requests into durable COPY transactions. Each transaction writes the raw logs plus a small grouped per-second **rollup delta** in the same transaction. Aggregation reads the compact rollups and committed deltas together, so new data is immediately counted without competing `UPSERT`s on the same current-second summary rows. A bounded background compactor moves delta chunks into the compact table transactionally, only outside active database queries; quiet-time work and a conservative backlog trigger prevent retained fixture data from consuming PostgreSQL's memory budget without creating a visibility gap. An HTTP request receives `200` only after both raw logs and its delta commit; all valid entries from that request stay together in one atomic COPY flush. `INGESTION_FLUSH_MAX_LOGS` defaults to `8192`. The standalone fallback is `100ms` / one writer; the evaluated Docker Compose profile explicitly uses `200ms` / two writers, so use Compose for comparable measurements. Queued requests that have already waited the delay start immediately when a writer becomes free.
 
 The common unfiltered `GET /logs?limit=20` read-after-write probe uses a small tenant-isolated first-page cache. It is seeded from PostgreSQL before becoming readable, merged synchronously only after durable commits, invalidated across retention, and bounded by both tenant count and bytes. Filtered queries and every cursor continuation still use PostgreSQL keyset pagination, and an oversized row drops the cache entry rather than weakening the database source of truth.
 
@@ -101,25 +101,24 @@ BASE_URL=http://127.0.0.1:8086 TARGET_LOGS_PER_SECOND=15000 DURATION_SECONDS=30 
 BASE_URL=http://127.0.0.1:8086 SCENARIO=load BATCH_SIZE=32 npm run benchmark:scenarios
 ```
 
-### Published local benchmark CLI
+### Course local benchmark CLI
 
-When the course's local tester is available, run it from this repository root
-with Docker Desktop already running. The pinned v0.5.0 revision below is intentional:
-it makes the invocation reproducible while the tester is still being validated
-across operating systems.
+Run the current course tester from this repository root with Docker Desktop
+already running. This is the command currently published by the course staff:
 
 ```powershell
-npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#f7f4eb0" --version
-npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#f7f4eb0" --compose ./docker-compose.yml --checks-only --seed 6122026
-npx --yes "github:Ahmad-Abbas-Foothill/logs-benchmark-cli#f7f4eb0" --compose ./docker-compose.yml --full --seed 6122026 --generator-cpus 2
+npx --yes github:Ahmad-Abbas-Foothill/logs-benchmark-cli --version
+npx --yes github:Ahmad-Abbas-Foothill/logs-benchmark-cli --compose ./docker-compose.yml --full --seed 6122026 --runner docker --json benchmark-report.json --generator-cpus 4
 ```
 
 The CLI starts and tears down Compose itself, applying the evaluated `0.5 CPU /
-256 MB` application and `1 CPU / 1 GB` PostgreSQL limits. Its correctness
-catalog is a strong contract check; its performance result remains
-machine-dependent, and a `dropped iterations` warning means the local score is
-diagnostic rather than a final platform grade. The generated
-`.load-generator.compose.override.yml` is intentionally ignored by Git.
+256 MB` application and `1 CPU / 1 GB` PostgreSQL limits. Its correctness catalog
+matches the platform catalog; performance, query, and reliability numbers remain
+machine-dependent. Always quote the reported machine-speed factor with a score.
+A generator-limited `dropped iterations` warning means the sender did not start
+every scheduled iteration; it is not an application rejection. The generated
+`.load-generator.compose.override.yml` and JSON reports are intentionally ignored
+by Git.
 
 Optional integration tests live in `scripts/optional-*-integration.ts`. Run each against a deployment where the corresponding feature is enabled, using `BASE_URL`:
 
@@ -166,37 +165,63 @@ k6 run scripts/k6-local-benchmark.js
 
 The same database may then be reused with another tag such as `stress-1`, so later runs query against the rows retained from earlier ones. Every log carries `attr.benchmark_run=<tag>` plus `attr.query_bucket` (default `0` through `99`); the cursor test selects only one bucket, or roughly 1% of the retained table. Set `FILTERED_BUCKET_MODULUS=50` to exercise the bounded page-session path with roughly 2% of a fresh 1.8M-row run. During ingestion, the script issues one aggregation per second, probes the rare tagged `attr.sequence=0` lookup every five seconds, and reads an explicitly limited sparse tagged page every second. Its final 30-second cursor drain supplies the attribute filters and explicit `limit` on the initial request, then passes only the opaque `next_cursor` on later pages. K6 may schedule one extra iteration exactly at the duration boundary; the script therefore requires the target minimum and verifies that the final visible count equals the actual accepted filtered count. It validates every page envelope plus the first/last row and cross-page ordering; inspecting every matching row locally would itself distort the drain timing. It fails locally if the sender drops scheduled work, a POST is not fully accepted, an aggregate fails or exceeds 1s p95, a tagged query fails while ingestion is active, the rare-attribute lookup misses its 20-second deadline, cursor ordering/shape is invalid, or the visible count does not equal the accepted filtered count. `PRE_ALLOCATED_VUS`, `MAX_VUS`, `FILTERED_BUCKET_MODULUS`, and `FILTERED_BUCKET` can be overridden if the local k6 sender is resource constrained or a different selectivity is desired. This is a local reproduction based on the published workload description and evaluator guidance, not the private grader script.
 
-### Previous Large-Batch Baseline
+### Measured Performance Results
 
-The latest acceptance benchmark was run on Windows with Docker Desktop under the Compose limits: application `0.5 CPU` and `256 MB`, PostgreSQL `1 CPU` and `1 GB`.
+The latest recorded full local course-CLI run completed on Windows with Docker
+Desktop on 2026-08-18. It used score model `2026-08-18.v10`, seed `6122026`,
+one million fixture rows, batches of 100 logs, and four aggregation requests per
+second while ingestion was active. The test ran against backend commit `d6ae94d`;
+the following commit only added the static dashboard shell and did not change the
+ingestion, query, aggregation, retention, schema, or index paths.
 
-| Metric | Result |
+| Test environment | Value |
 | --- | ---: |
-| Dataset size | 1,000,000 records |
-| Batch size | 1,000 records |
-| Concurrency | 8 requests |
-| Accepted records | 1,000,000 (zero rejections) |
-| Ingestion rate | 19,907.45 records/second |
-| Ingestion p50 | 292.53 ms per batch |
-| Ingestion p95 | 1,167.31 ms per batch |
-| Aggregation p50 | 61.09 ms |
-| Aggregation p95 | 255.49 ms |
-| Observed application peak (comparable run) | 39.56% CPU, 84.89 MiB RAM |
-| Observed PostgreSQL peak (comparable run) | 105.01% CPU, 693.70 MiB RAM |
+| Docker engine | Docker Desktop, 20 logical CPUs, 15.43 GiB RAM |
+| Machine speed | 0.61x reference |
+| Load generator | 4 CPUs, 1 GiB RAM |
+| Application limit | 0.5 CPU, 256 MiB RAM |
+| PostgreSQL limit | 1 CPU, 1 GiB RAM |
+| Fixture dataset | 1,000,000 records |
+| Ingestion batch size | 100 records |
+| Aggregation query rate | 4 requests/second |
 
-These figures are a prior large-batch baseline. The small-batch micro-batching implementation and `benchmark:regression` harness were added specifically to cover the external benchmark's higher request rate; rerun that harness before quoting a new final performance result. The resource peaks listed in the table were recorded with `docker stats` during a comparable concurrent load on the same environment; memory stayed within the imposed limits for both containers.
+| Result | Measured value |
+| --- | ---: |
+| Correctness | 15/15 checks |
+| Local score | 95.1/100 |
+| Load ingestion rate | 14,999.17 records/second |
+| Load POST error rate | 0% |
+| Load POST p95 | 296.84 ms per batch |
+| Load aggregation p95 | 10 ms |
+| Eventual consistency | 4/4 scenarios |
+| Reliability | 4/4 scenarios, no application crash |
+
+| Scenario | Ingestion rate | POST p95 | Aggregate p95 | Errors | Accepted / visible | Generator-limited iterations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Load | 14,999.17/s | 296.84 ms | 10 ms | 0% | 1,799,900 / 1,799,900 | 0 |
+| Stress | 20,636/s | 1,275.56 ms | 60 ms | 0% | 3,095,400 / 3,095,400 | 545 |
+| Spike | 15,218/s | 310.07 ms | 19.10 ms | 0% | 1,521,800 / 1,521,800 | 156 |
+| Breakpoint | 22,834.17/s | 2,482.80 ms | 158 ms | 0% | 2,740,100 / 2,740,100 | 1,848 |
+
+The CLI report records the enforced per-container resource limits but does not
+sample peak container CPU or RAM, so no unmeasured utilization figures are
+claimed here. Stress, spike, and breakpoint were retained by the scorer but had
+generator-limited iterations; the CLI explicitly classified the generator, not
+the service, as the constraint. The load scenario had no dropped iteration, all
+accepted records became visible, and its aggregation p95 remained well below the
+one-second target.
 
 ## Repository Hygiene
 
 `.env` and `node_modules` are intentionally excluded from Git. Copy `.env.example` to `.env` only for local development; never commit real keys, webhooks, or credentials. Docker uses `.dockerignore` separately to keep local files out of the image build context.
 
-## Performance Notes and Limitations
+## Known Limitations and Performance Notes
 
-The primary bottleneck identified was multi-value `INSERT` under concurrent load; it was replaced with `COPY FROM STDIN`. Maintaining raw-row rollups on every insert also pressures PostgreSQL, so per-second summaries were added with an accurate raw-row fallback for time edges and text/attribute filters. Existing indexes keep filter and cursor queries fast but add natural write overhead. `q` and uncommon attribute filters are the most expensive paths; attributes use a GIN index, while `q` uses a correct raw-row substring filter to avoid a write-heavy trigram index. Aggregation requires a mandatory time range to avoid unrestricted table scans.
+The primary bottleneck identified was multi-value `INSERT` under concurrent load; it was replaced with `COPY FROM STDIN`. Maintaining raw-row rollups on every insert also pressures PostgreSQL, so per-second summaries were added with an accurate raw-row fallback for time edges and text/attribute filters. Existing indexes keep filter and cursor queries fast but add natural write overhead. `q` and uncommon attribute filters are the most expensive paths; attributes use a GIN index, while `q` uses a correct raw-row substring filter to avoid a write-heavy trigram index. Aggregation requires a mandatory time range to avoid unrestricted table scans. Bounded query sessions deliberately fall back to stateless keyset pagination after expiry, restart, or a capacity decision, so unusually broad attribute walks may trade speed for bounded memory. Local performance scores vary with machine speed and generator capacity; only the correctness catalog transfers exactly to the platform grade.
 
 ## Optional Features and CI
 
-No optional features are enabled by default: no authentication, API keys, multi-tenancy, rate limiting, or quota. The service ignores any `Authorization` header and serves all four required endpoints without prior configuration via `docker compose up`.
+Every optional control that could restrict the required contract is disabled by default: no authentication, API-key enforcement, tenant restriction, rate limiting, quota, or backpressure applies. The additive dashboard and custom query syntax are available without changing any required endpoint. With authentication disabled, the service ignores any `Authorization` header and serves all four required endpoints without prior configuration via `docker compose up`.
 
 The project includes `smoke:test` for the API contract and `load:test` for performance measurement. GitHub Actions in `.github/workflows/ci.yml` runs type checking and unit tests, then builds Docker Compose and runs the smoke test in both unauthenticated and authenticated modes with a seeded key. The load test is run manually because the one-million-record benchmark is time-intensive.
 
