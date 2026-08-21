@@ -168,16 +168,15 @@ The same database may then be reused with another tag such as `stress-1`, so lat
 ### Measured Performance Results
 
 The latest recorded full local course-CLI run completed on Windows with Docker
-Desktop on 2026-08-18. It used score model `2026-08-18.v10`, seed `6122026`,
-one million fixture rows, batches of 100 logs, and four aggregation requests per
-second while ingestion was active. The test ran against backend commit `d6ae94d`;
-the following commit only added the static dashboard shell and did not change the
-ingestion, query, aggregation, retention, schema, or index paths.
+Desktop on 2026-08-21 using `@foothill/logs-benchmark` 0.6.0. It used score
+model `2026-08-18.v10`, seed `6122026`, one million fixture rows, batches of 100
+logs, and four aggregation requests per second while ingestion was active. The
+test ran against backend commit `14ace31`.
 
 | Test environment | Value |
 | --- | ---: |
 | Docker engine | Docker Desktop, 20 logical CPUs, 15.43 GiB RAM |
-| Machine speed | 0.61x reference |
+| Machine speed | 0.64x reference |
 | Load generator | 4 CPUs, 1 GiB RAM |
 | Application limit | 0.5 CPU, 256 MiB RAM |
 | PostgreSQL limit | 1 CPU, 1 GiB RAM |
@@ -188,20 +187,22 @@ ingestion, query, aggregation, retention, schema, or index paths.
 | Result | Measured value |
 | --- | ---: |
 | Correctness | 15/15 checks |
-| Local score | 95.1/100 |
+| Local score | 95.2/100 |
+| Performance | 45.3/50 |
+| Queries | 14.9/15 |
 | Load ingestion rate | 14,999.17 records/second |
 | Load POST error rate | 0% |
-| Load POST p95 | 296.84 ms per batch |
-| Load aggregation p95 | 10 ms |
+| Load POST p95 | 294.69 ms per batch |
+| Load aggregation p95 | 8.05 ms |
 | Eventual consistency | 4/4 scenarios |
-| Reliability | 4/4 scenarios, no application crash |
+| Reliability | 20/20; 4/4 scenarios, no application crash |
 
 | Scenario | Ingestion rate | POST p95 | Aggregate p95 | Errors | Accepted / visible | Generator-limited iterations |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Load | 14,999.17/s | 296.84 ms | 10 ms | 0% | 1,799,900 / 1,799,900 | 0 |
-| Stress | 20,636/s | 1,275.56 ms | 60 ms | 0% | 3,095,400 / 3,095,400 | 545 |
-| Spike | 15,218/s | 310.07 ms | 19.10 ms | 0% | 1,521,800 / 1,521,800 | 156 |
-| Breakpoint | 22,834.17/s | 2,482.80 ms | 158 ms | 0% | 2,740,100 / 2,740,100 | 1,848 |
+| Load | 14,999.17/s | 294.69 ms | 8.05 ms | 0% | 1,799,900 / 1,799,900 | 0 |
+| Stress | 20,746.67/s | 367.66 ms | 23 ms | 0% | 3,112,000 / 3,112,000 | 379 |
+| Spike | 15,313/s | 306.77 ms | 16 ms | 0% | 1,531,300 / 1,531,300 | 62 |
+| Breakpoint | 23,709.17/s | 1,726.17 ms | 149 ms | 0% | 2,845,100 / 2,845,100 | 799 |
 
 The CLI report records the enforced per-container resource limits but does not
 sample peak container CPU or RAM, so no unmeasured utilization figures are
